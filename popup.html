@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoHangout</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🛋️ AutoHangout</h1>
+      <p class="subtitle">躺平浏览模式</p>
+    </header>
+
+    <div class="status-section">
+      <div class="status-indicator" id="statusIndicator">
+        <span class="status-dot"></span>
+        <span class="status-text" id="statusText">已停止</span>
+      </div>
+    </div>
+
+    <button class="toggle-btn" id="toggleBtn">
+      <span class="btn-icon" id="btnIcon">▶</span>
+      <span class="btn-text" id="btnText">开始浏览</span>
+    </button>
+
+    <div class="settings-section">
+      <h2>⚙️ 设置</h2>
+      
+      <div class="setting-item">
+        <label for="scrollSpeed">滚动速度 (越小越慢)</label>
+        <div class="setting-control">
+          <input type="range" id="scrollSpeed" min="1" max="10" value="3">
+          <span id="scrollSpeedValue">3</span>
+        </div>
+      </div>
+
+      <div class="setting-item">
+        <label for="backProbability">短帖提前退出概率</label>
+        <div class="setting-control">
+          <input type="range" id="backProbability" min="10" max="90" value="30">
+          <span id="backProbabilityValue">30</span>%
+        </div>
+      </div>
+    </div>
+
+    <div class="info-section">
+      <h3>📖 阅读规则</h3>
+      <ul>
+        <li>长帖 (≥50层): 读完 90% 才退出</li>
+        <li>中帖 (20-49层): 读完 80% 才退出</li>
+        <li>短帖 (<20层): 50% 后按概率退出</li>
+      </ul>
+    </div>
+
+    <footer>
+      <p class="hint">💡 浏览器最小化时也会继续运行</p>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
