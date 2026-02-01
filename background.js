@@ -1,6 +1,6 @@
 // Background Service Worker for AutoHangout
-// Uses Chrome Debugger API with keyboard simulation for true background scrolling
-// v2.1 - Added Offscreen Document + keyboard events for better reliability
+// Uses Chrome Debugger API with Runtime.evaluate for true background scrolling
+// v2.2 - Fixed debugger attachment and removed invalid commands
 
 let isRunning = false;
 let settings = {
@@ -11,7 +11,7 @@ let activeTabId = null;
 let debuggerAttached = false;
 let offscreenCreated = false;
 
-console.log('[AutoHangout BG] Service worker started (v2.1 - Keyboard + Offscreen)');
+console.log('[AutoHangout BG] Service worker started (v2.2 - Fixed)');
 
 // ============ OFFSCREEN DOCUMENT ============
 async function setupOffscreen() {
@@ -32,14 +32,19 @@ async function setupOffscreen() {
     // Create offscreen document
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['BLOBS'],  // Use a valid reason
+      reasons: ['BLOBS'],
       justification: 'Keep service worker alive for background automation'
     });
     
     offscreenCreated = true;
     console.log('[AutoHangout BG] Offscreen document created');
   } catch (e) {
-    console.error('[AutoHangout BG] Failed to create offscreen document:', e);
+    // Ignore "already exists" error
+    if (e.message?.includes('single offscreen')) {
+      offscreenCreated = true;
+    } else {
+      console.error('[AutoHangout BG] Offscreen error:', e.message);
+    }
   }
 }
 
@@ -106,15 +111,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
       
     case 'offscreenPing':
-      // Ping from offscreen document - keeps service worker alive
-      console.log('[AutoHangout BG] Offscreen ping received');
       sendResponse({ alive: true });
       break;
       
     case 'requestNavigation':
-      // Content script requests navigation
       if (sender.tab && message.url) {
-        performNavigation(sender.tab.id, message.url);
+        chrome.tabs.update(sender.tab.id, { url: message.url });
       }
       sendResponse({ success: true });
       break;
@@ -125,8 +127,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ============ DEBUGGER FUNCTIONS ============
 async function attachDebugger(tabId) {
+  // Already attached? Just return true
   if (debuggerAttached) {
-    console.log('[AutoHangout BG] Debugger already attached');
     return true;
   }
   
@@ -134,14 +136,15 @@ async function attachDebugger(tabId) {
     await chrome.debugger.attach({ tabId }, '1.3');
     debuggerAttached = true;
     console.log('[AutoHangout BG] Debugger attached to tab:', tabId);
-    
-    // Enable required domains
-    await chrome.debugger.sendCommand({ tabId }, 'Input.enable', {});
-    await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
-    console.log('[AutoHangout BG] Debugger domains enabled');
     return true;
   } catch (e) {
-    console.error('[AutoHangout BG] Failed to attach debugger:', e);
+    // If already attached, that's fine
+    if (e.message?.includes('Another debugger is already attached')) {
+      debuggerAttached = true;
+      console.log('[AutoHangout BG] Debugger was already attached');
+      return true;
+    }
+    console.error('[AutoHangout BG] Failed to attach debugger:', e.message);
     debuggerAttached = false;
     return false;
   }
@@ -153,83 +156,46 @@ async function detachDebugger(tabId) {
   try {
     await chrome.debugger.detach({ tabId });
     debuggerAttached = false;
-    console.log('[AutoHangout BG] Debugger detached from tab:', tabId);
+    console.log('[AutoHangout BG] Debugger detached');
   } catch (e) {
-    console.error('[AutoHangout BG] Failed to detach debugger:', e);
+    console.log('[AutoHangout BG] Detach error (may be already detached):', e.message);
+    debuggerAttached = false;
   }
 }
 
-// Perform scroll using keyboard simulation (more reliable than mouse wheel)
+// Perform scroll using Runtime.evaluate
 async function performDebuggerScroll(tabId, scrollAmount) {
+  // Ensure debugger is attached
   if (!debuggerAttached) {
     const attached = await attachDebugger(tabId);
-    if (!attached) return false;
-  }
-  
-  try {
-    // Method 1: Use Runtime.evaluate to execute scrollBy directly
-    // This is more reliable than simulating input events
-    await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-      expression: `window.scrollBy({ top: ${scrollAmount}, behavior: 'auto' })`,
-      userGesture: true
-    });
-    
-    console.log('[AutoHangout BG] Runtime.evaluate scroll:', scrollAmount, 'px');
-    return true;
-  } catch (e) {
-    console.error('[AutoHangout BG] Runtime.evaluate scroll failed:', e);
-    
-    // Method 2: Try keyboard simulation (Page Down)
-    try {
-      // Calculate how many Page Down presses based on scroll amount
-      const presses = Math.max(1, Math.floor(scrollAmount / 100));
-      
-      for (let i = 0; i < presses; i++) {
-        // Key down
-        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-          type: 'keyDown',
-          key: 'PageDown',
-          code: 'PageDown',
-          windowsVirtualKeyCode: 34,
-          nativeVirtualKeyCode: 34
-        });
-        
-        // Key up
-        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-          type: 'keyUp',
-          key: 'PageDown',
-          code: 'PageDown',
-          windowsVirtualKeyCode: 34,
-          nativeVirtualKeyCode: 34
-        });
-        
-        // Small delay between presses
-        await new Promise(r => setTimeout(r, 50));
-      }
-      
-      console.log('[AutoHangout BG] Keyboard scroll (PageDown x', presses, ')');
-      return true;
-    } catch (e2) {
-      console.error('[AutoHangout BG] Keyboard scroll failed:', e2);
-      debuggerAttached = false;
+    if (!attached) {
+      console.log('[AutoHangout BG] Cannot scroll - debugger not attached');
       return false;
     }
   }
-}
-
-// Perform navigation using debugger
-async function performNavigation(tabId, url) {
-  if (!debuggerAttached) {
-    await attachDebugger(tabId);
-  }
   
   try {
-    await chrome.debugger.sendCommand({ tabId }, 'Page.navigate', { url });
-    console.log('[AutoHangout BG] Navigated to:', url);
+    // Use Runtime.evaluate to execute scrollBy directly
+    const result = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+      expression: `
+        (function() {
+          window.scrollBy({ top: ${scrollAmount}, behavior: 'auto' });
+          return { scrollY: window.scrollY, scrolled: ${scrollAmount} };
+        })()
+      `,
+      returnByValue: true
+    });
+    
+    console.log('[AutoHangout BG] Scroll executed:', scrollAmount, 'px, result:', result?.result?.value);
+    return true;
   } catch (e) {
-    console.error('[AutoHangout BG] Navigation failed:', e);
-    // Fallback to tabs API
-    chrome.tabs.update(tabId, { url });
+    console.error('[AutoHangout BG] Scroll failed:', e.message);
+    
+    // If debugger was detached, mark it and try to reattach next time
+    if (e.message?.includes('not attached') || e.message?.includes('No tab')) {
+      debuggerAttached = false;
+    }
+    return false;
   }
 }
 
@@ -237,10 +203,10 @@ async function performNavigation(tabId, url) {
 async function startAutomation() {
   console.log('[AutoHangout BG] Starting automation');
   
-  // Setup offscreen document first
+  // Setup offscreen document
   await setupOffscreen();
   
-  // Clear any existing alarms
+  // Clear existing alarms
   await chrome.alarms.clearAll();
   
   // Main scroll trigger - every 3 seconds
@@ -249,32 +215,27 @@ async function startAutomation() {
     periodInMinutes: 0.05 
   });
   
-  // Heartbeat for content script - every 15 seconds
+  // Heartbeat - every 15 seconds
   chrome.alarms.create('autoHangout-heartbeat', { 
     delayInMinutes: 0.25,
     periodInMinutes: 0.25 
   });
   
-  // Keep alive ping - every 20 seconds
+  // Keep alive - every 20 seconds
   chrome.alarms.create('autoHangout-keepalive', { 
     delayInMinutes: 0.33,
     periodInMinutes: 0.33 
   });
   
-  // Debugger check - every 30 seconds
-  chrome.alarms.create('autoHangout-debugger-check', { 
-    delayInMinutes: 0.5,
-    periodInMinutes: 0.5 
-  });
-  
-  // Initial broadcast and attach debugger
+  // Broadcast start
   broadcastToContentScripts({ action: 'start', settings });
   
+  // Attach debugger
   if (activeTabId) {
     await attachDebugger(activeTabId);
   }
   
-  console.log('[AutoHangout BG] Automation started, alarms set');
+  console.log('[AutoHangout BG] Automation started');
 }
 
 async function stopAutomation() {
@@ -289,20 +250,19 @@ async function stopAutomation() {
 
 // ============ ALARM HANDLERS ============
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  // Log all alarms for debugging
-  const now = new Date().toISOString();
-  console.log(`[AutoHangout BG] [${now}] Alarm: ${alarm.name}, isRunning: ${isRunning}`);
-  
   if (!isRunning) return;
   
+  const now = new Date().toLocaleTimeString();
+  
   if (alarm.name === 'autoHangout-scroll') {
-    // Perform scroll via debugger
+    console.log(`[AutoHangout BG] [${now}] Scroll alarm`);
+    
     if (activeTabId) {
-      // Check if tab still exists
       try {
+        // Verify tab exists
         const tab = await chrome.tabs.get(activeTabId);
         if (!tab || !tab.url?.startsWith('https://linux.do/')) {
-          console.log('[AutoHangout BG] Tab no longer valid');
+          console.log('[AutoHangout BG] Tab invalid, skipping scroll');
           return;
         }
         
@@ -314,40 +274,34 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         
         if (success) {
           // Notify content script
-          try {
-            await chrome.tabs.sendMessage(activeTabId, { 
-              action: 'scrollPerformed', 
-              scrollAmount 
-            });
-          } catch (e) {
-            // Content script might not be ready
-          }
+          chrome.tabs.sendMessage(activeTabId, { 
+            action: 'scrollPerformed', 
+            scrollAmount 
+          }).catch(() => {});
         }
       } catch (e) {
-        console.error('[AutoHangout BG] Error during scroll:', e);
+        console.error('[AutoHangout BG] Scroll alarm error:', e.message);
       }
     }
   }
   
   if (alarm.name === 'autoHangout-heartbeat') {
+    console.log(`[AutoHangout BG] [${now}] Heartbeat`);
     await broadcastToContentScripts({ action: 'heartbeat', settings });
   }
   
   if (alarm.name === 'autoHangout-keepalive') {
-    console.log('[AutoHangout BG] Keepalive - debugger attached:', debuggerAttached);
+    console.log(`[AutoHangout BG] [${now}] Keepalive - debugger: ${debuggerAttached}`);
     
-    // Re-check state from storage
+    // Re-check state
     const data = await chrome.storage.local.get(['isRunning']);
     if (data.isRunning && !isRunning) {
       isRunning = true;
       await startAutomation();
     }
-  }
-  
-  if (alarm.name === 'autoHangout-debugger-check') {
-    // Ensure debugger is still attached
+    
+    // Ensure debugger attached
     if (activeTabId && !debuggerAttached) {
-      console.log('[AutoHangout BG] Re-attaching debugger');
       await attachDebugger(activeTabId);
     }
   }
@@ -358,11 +312,11 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   console.log('[AutoHangout BG] Debugger detached:', reason);
   debuggerAttached = false;
   
-  // Try to reattach if still running (unless user cancelled)
+  // Reattach if running (unless user cancelled)
   if (isRunning && activeTabId && reason !== 'canceled_by_user') {
     setTimeout(async () => {
       if (isRunning) {
-        console.log('[AutoHangout BG] Attempting to reattach debugger');
+        console.log('[AutoHangout BG] Reattaching debugger...');
         await attachDebugger(activeTabId);
       }
     }, 2000);
@@ -380,12 +334,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       activeTabId = tabId;
       chrome.storage.local.set({ activeTabId });
       
-      // Wait a bit then attach debugger
+      // Detach old, attach new
+      debuggerAttached = false;
       setTimeout(async () => {
-        debuggerAttached = false;
         await attachDebugger(tabId);
         chrome.tabs.sendMessage(tabId, { action: 'start', settings }).catch(() => {});
-      }, 2000);
+      }, 1500);
     }
   }
 });
@@ -396,8 +350,9 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab.url?.startsWith('https://linux.do/')) {
-      console.log('[AutoHangout BG] linux.do tab activated:', activeInfo.tabId);
+      console.log('[AutoHangout BG] Tab activated:', activeInfo.tabId);
       
+      // Switch to new tab
       if (activeTabId && activeTabId !== activeInfo.tabId) {
         await detachDebugger(activeTabId);
       }
@@ -406,9 +361,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
       chrome.storage.local.set({ activeTabId });
       await attachDebugger(activeTabId);
     }
-  } catch (e) {
-    // Tab might not exist
-  }
+  } catch (e) {}
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -424,12 +377,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (!isRunning) return;
   
-  console.log('[AutoHangout BG] Window focus changed:', windowId);
+  console.log('[AutoHangout BG] Window focus:', windowId);
   
-  // Ensure alarms are still running
+  // Check alarms still running
   chrome.alarms.get('autoHangout-scroll', async (alarm) => {
     if (!alarm && isRunning) {
-      console.log('[AutoHangout BG] Re-creating alarms after focus change');
+      console.log('[AutoHangout BG] Recreating alarms');
       await startAutomation();
     }
   });
@@ -439,7 +392,6 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 async function broadcastToContentScripts(message) {
   try {
     const tabs = await chrome.tabs.query({ url: 'https://linux.do/*' });
-    console.log('[AutoHangout BG] Broadcasting to', tabs.length, 'tabs');
     
     for (const tab of tabs) {
       try {
@@ -459,7 +411,7 @@ async function broadcastToContentScripts(message) {
       }
     }
   } catch (e) {
-    console.error('[AutoHangout BG] Error broadcasting:', e);
+    console.error('[AutoHangout BG] Broadcast error:', e.message);
   }
 }
 
@@ -477,8 +429,7 @@ self.addEventListener('activate', (event) => {
   });
 });
 
-// Keep service worker alive by setting up offscreen on install
-self.addEventListener('install', async (event) => {
+self.addEventListener('install', () => {
   console.log('[AutoHangout BG] Service worker installed');
   self.skipWaiting();
 });
