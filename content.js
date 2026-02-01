@@ -1,6 +1,6 @@
 // AutoHangout Content Script
 // Human-like browsing for linux.do (Discourse)
-// v5.0 - Background running support
+// v2.0 - Debugger API background support
 
 (function() {
   'use strict';
@@ -16,6 +16,7 @@
   let lastProgress = 0;
   let stuckCount = 0;
   let lastActivityTime = Date.now();
+  let isBackgroundMode = false;  // True when tab is not visible
   
   let settings = {
     scrollSpeed: 3,
@@ -28,7 +29,7 @@
     if (DEBUG) console.log('[AutoHangout]', ...args);
   }
 
-  log('=== Script loaded ===', window.location.pathname);
+  log('=== Script loaded (Debugger API version) ===', window.location.pathname);
 
   // Notify background that we're ready
   chrome.runtime.sendMessage({ action: 'tabReady' }).catch(() => {});
@@ -57,26 +58,39 @@
           restartBehavior();
         }
       }
+    } else if (message.action === 'scrollPerformed') {
+      // Background performed a scroll via debugger
+      if (isRunning) {
+        scrollCount++;
+        lastActivityTime = Date.now();
+        log(`[BG Scroll] #${scrollCount}: ${message.scrollAmount}px`);
+        
+        // Check if we should exit the topic
+        if (getPageType() === 'topic') {
+          checkTopicProgress();
+        }
+      }
     }
     
     sendResponse({ success: true });
     return true;
   });
 
-  // Listen for background scroll trigger (for inactive tabs)
-  window.addEventListener('autoHangout-triggerScroll', () => {
-    if (isRunning) {
-      log('Background trigger received');
-      doSingleScroll();
-    }
-  });
-
   // Handle visibility change (when tab becomes hidden/visible)
   document.addEventListener('visibilitychange', () => {
     log('Visibility:', document.visibilityState);
+    isBackgroundMode = document.visibilityState === 'hidden';
+    
     if (document.visibilityState === 'visible' && isRunning) {
-      // Tab became visible again, ensure we're running
+      // Tab became visible again - can use normal scrolling
+      isBackgroundMode = false;
       restartBehavior();
+    } else if (document.visibilityState === 'hidden' && isRunning) {
+      // Tab hidden - switch to background mode (debugger will handle scrolling)
+      isBackgroundMode = true;
+      log('Switched to background mode - debugger will handle scrolling');
+      // Clear local scroll timers, let background handle it
+      clearTimeout(scrollTimeout);
     }
   });
 
@@ -96,9 +110,10 @@
     lastProgress = 0;
     lastActivityTime = Date.now();
     topicInfo = null;
+    isBackgroundMode = document.visibilityState === 'hidden';
     
     const pageType = getPageType();
-    log('Starting, page:', pageType);
+    log('Starting, page:', pageType, 'background:', isBackgroundMode);
     
     setTimeout(() => {
       if (!isRunning) return;
@@ -106,7 +121,13 @@
       if (pageType === 'topic') {
         topicInfo = getTopicProgress();
         log('Topic info:', topicInfo);
-        doTopicBehavior();
+        
+        // Only start local scrolling if visible
+        if (!isBackgroundMode) {
+          doTopicBehavior();
+        } else {
+          log('Background mode - waiting for debugger scrolls');
+        }
       } else {
         doListBehavior();
       }
@@ -130,7 +151,9 @@
     log('Restarting behavior for:', pageType);
     
     if (pageType === 'topic') {
-      doTopicBehavior();
+      if (!isBackgroundMode) {
+        doTopicBehavior();
+      }
     } else {
       doListBehavior();
     }
@@ -230,9 +253,22 @@
     return false;
   }
 
+  // Check progress and potentially leave topic (called by background scroll notifications)
+  function checkTopicProgress() {
+    if (shouldExitTopic()) {
+      leaveCurrentTopic();
+    }
+  }
+
   // ============ TOPIC BEHAVIOR ============
   function doTopicBehavior() {
     if (!isRunning) return;
+    
+    // In background mode, scrolling is handled by debugger
+    if (isBackgroundMode) {
+      log('Background mode active - debugger handling scrolls');
+      return;
+    }
     
     lastActivityTime = Date.now();
     
@@ -256,7 +292,7 @@
     scrollTimeout = setTimeout(() => doTopicBehavior(), delay);
   }
 
-  // Single scroll action (can be triggered by background)
+  // Single scroll action (for foreground mode)
   function doSingleScroll() {
     scrollCount++;
     lastActivityTime = Date.now();
