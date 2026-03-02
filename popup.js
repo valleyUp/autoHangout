@@ -7,8 +7,6 @@ const statusIndicator = document.getElementById('statusIndicator');
 const statusText = document.getElementById('statusText');
 const scrollSpeedInput = document.getElementById('scrollSpeed');
 const scrollSpeedValue = document.getElementById('scrollSpeedValue');
-const backProbabilityInput = document.getElementById('backProbability');
-const backProbabilityValue = document.getElementById('backProbabilityValue');
 
 let isRunning = false;
 
@@ -20,8 +18,6 @@ chrome.storage.local.get(['isRunning', 'settings'], (data) => {
   if (data.settings) {
     scrollSpeedInput.value = data.settings.scrollSpeed || 3;
     scrollSpeedValue.textContent = scrollSpeedInput.value;
-    backProbabilityInput.value = data.settings.backProbability || 30;
-    backProbabilityValue.textContent = backProbabilityInput.value;
   }
 });
 
@@ -43,8 +39,7 @@ function updateUI() {
 
 function getSettings() {
   return {
-    scrollSpeed: parseInt(scrollSpeedInput.value),
-    backProbability: parseInt(backProbabilityInput.value)
+    scrollSpeed: parseInt(scrollSpeedInput.value)
   };
 }
 
@@ -82,17 +77,14 @@ toggleBtn.addEventListener('click', async () => {
   // Notify background
   chrome.runtime.sendMessage({
     action: isRunning ? 'start' : 'stop',
-    settings: getSettings()
+    settings: getSettings(),
+    tabId: tab?.id,
+    tabUrl: tab?.url
   });
 });
 
 // Settings listeners
 scrollSpeedInput.addEventListener('input', () => {
   scrollSpeedValue.textContent = scrollSpeedInput.value;
-  saveSettings();
-});
-
-backProbabilityInput.addEventListener('input', () => {
-  backProbabilityValue.textContent = backProbabilityInput.value;
   saveSettings();
 });

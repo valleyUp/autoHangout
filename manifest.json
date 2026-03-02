@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoHangout",
-  "version": "2.1.0",
+  "version": "2.3.2",
   "description": "自动浏览 Discourse 论坛 - 使用 Debugger API + Offscreen 支持后台运行",
   "permissions": [
     "activeTab",

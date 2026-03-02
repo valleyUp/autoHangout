@@ -35,22 +35,13 @@
           <span id="scrollSpeedValue">3</span>
         </div>
       </div>
-
-      <div class="setting-item">
-        <label for="backProbability">短帖提前退出概率</label>
-        <div class="setting-control">
-          <input type="range" id="backProbability" min="10" max="90" value="30">
-          <span id="backProbabilityValue">30</span>%
-        </div>
-      </div>
     </div>
 
     <div class="info-section">
       <h3>📖 阅读规则</h3>
       <ul>
-        <li>长帖 (≥50层): 读完 90% 才退出</li>
-        <li>中帖 (20-49层): 读完 80% 才退出</li>
-        <li>短帖 (<20层): 50% 后按概率退出</li>
+        <li>退出阈值会根据帖子长度自动生成</li>
+        <li>读完自动返回帖子列表并继续</li>
       </ul>
     </div>
 

@@ -3,13 +3,31 @@
 
 console.log('[AutoHangout Offscreen] Document loaded');
 
-// Periodic ping to keep alive
+const TICK_MS = 3000;
+const PING_MS = 20000;
+let lastPingAt = 0;
+
+function safeSendMessage(message) {
+  try {
+    const result = chrome?.runtime?.sendMessage?.(message);
+    if (result && typeof result.catch === 'function') {
+      result.catch(() => {});
+    }
+  } catch (_) {}
+}
+
 setInterval(() => {
-  console.log('[AutoHangout Offscreen] Keepalive ping', new Date().toISOString());
+  const now = Date.now();
   
-  // Send message to service worker to keep it alive
-  chrome.runtime.sendMessage({ action: 'offscreenPing' }).catch(() => {});
-}, 20000);
+  // High-frequency tick used to drive automation even when the tab is in background.
+  safeSendMessage({ action: 'offscreenTick', now });
+  
+  // Lower-frequency ping used as a simple keepalive signal.
+  if (now - lastPingAt >= PING_MS) {
+    lastPingAt = now;
+    safeSendMessage({ action: 'offscreenPing', now });
+  }
+}, TICK_MS);
 
 // Listen for messages from service worker
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
