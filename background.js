@@ -15,9 +15,15 @@ let offscreenCreated = false;
 let scrollInProgress = false;
 let tabVisibilityStateById = {};
 let lastScrollAt = 0;
+let topicProgressByTabId = {};
+let backgroundListTickCount = 0;
+let backgroundNextListNavigateTick = 0;
+let lastBackgroundListNavigateAt = 0;
+let lastBackgroundTopicAdvanceAt = 0;
 
 const MIN_SCROLL_INTERVAL_MS = 2500;
 const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
+const MIN_BACKGROUND_TOPIC_ADVANCE_MS = 12000;
 
 console.log('[AutoHangout BG] Service worker started (v2.3.2)');
 
@@ -41,6 +47,26 @@ function parseTopicIdFromUrl(url) {
   if (typeof url !== 'string') return null;
   const m = url.match(/https:\/\/linux\.do\/t\/[^/]+\/(\d+)/);
   return m ? m[1] : null;
+}
+
+function parseTopicContextFromUrl(url) {
+  if (typeof url !== 'string') return null;
+  const m = url.match(/^https:\/\/linux\.do\/t\/([^/]+)\/(\d+)(?:\/(\d+))?/);
+  if (!m) return null;
+  return {
+    slug: m[1],
+    topicId: m[2],
+    postNumber: m[3] ? parseInt(m[3], 10) : 1
+  };
+}
+
+function buildTopicUrl(slug, topicId, postNumber) {
+  if (!topicId) return null;
+  const safeSlug = slug || '-';
+  if (!postNumber || postNumber <= 1) {
+    return `https://linux.do/t/${safeSlug}/${topicId}`;
+  }
+  return `https://linux.do/t/${safeSlug}/${topicId}/${postNumber}`;
 }
 
 function touchHistoryOrder(topicId) {
@@ -99,6 +125,153 @@ function scheduleHistorySave() {
     historySaveTimer = null;
     chrome.storage.local.set({ [TOPIC_HISTORY_KEY]: topicHistory }).catch(() => {});
   }, 500);
+}
+
+function resetBackgroundListPlan() {
+  backgroundListTickCount = 0;
+  backgroundNextListNavigateTick = 3 + Math.floor(Math.random() * 6);
+}
+
+async function ensureTabPersistence(tabId) {
+  if (typeof tabId !== 'number') return;
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+  } catch (_) {}
+}
+
+async function fetchLatestTopicPool() {
+  const response = await fetch('https://linux.do/latest.json', {
+    credentials: 'include',
+    cache: 'no-store'
+  });
+  if (!response.ok) {
+    throw new Error(`latest_fetch_failed:${response.status}`);
+  }
+
+  const data = await response.json();
+  const topics = Array.isArray(data?.topic_list?.topics)
+    ? data.topic_list.topics
+    : [];
+
+  return topics
+    .filter((topic) => topic?.id && topic?.slug && (topic.archetype === undefined || topic.archetype === 'regular'))
+    .map((topic) => ({
+      id: String(topic.id),
+      slug: topic.slug,
+      url: buildTopicUrl(topic.slug, String(topic.id), 1)
+    }))
+    .filter((topic) => Boolean(topic.url));
+}
+
+async function navigateToRandomTopicFromFeed(now) {
+  if (!activeTabId) return false;
+
+  backgroundListTickCount++;
+  if (!backgroundNextListNavigateTick) resetBackgroundListPlan();
+  if (backgroundListTickCount < backgroundNextListNavigateTick) return false;
+  if (now - lastBackgroundListNavigateAt < 15000) return false;
+
+  try {
+    const topics = await fetchLatestTopicPool();
+    if (topics.length === 0) {
+      resetBackgroundListPlan();
+      return false;
+    }
+
+    const unvisited = topics.filter((topic) => !topicHistory.topics?.[topic.id]);
+    const pool = unvisited.length > 0 ? unvisited : topics;
+    const topic = pool[Math.floor(Math.random() * pool.length)];
+    if (!topic?.url) {
+      resetBackgroundListPlan();
+      return false;
+    }
+
+    lastBackgroundListNavigateAt = now;
+    resetBackgroundListPlan();
+    recordTopicSeen(topic.url);
+    await ensureTabPersistence(activeTabId);
+    await chrome.tabs.update(activeTabId, { url: topic.url });
+    console.log('[AutoHangout BG] Background feed selected topic:', topic.url);
+    return true;
+  } catch (e) {
+    console.warn('[AutoHangout BG] Failed to fetch latest topics:', e?.message || String(e));
+    resetBackgroundListPlan();
+    return false;
+  }
+}
+
+async function finishBackgroundTopic(url) {
+  const topicId = parseTopicIdFromUrl(url);
+  if (topicId) {
+    recordTopicCompleted({ topicId, url, readPercent: 100 });
+  }
+
+  if (settings.readMode === 'currentTopic') {
+    if (settings.currentTopicAfterFinish === 'stop') {
+      isRunning = false;
+      await chrome.storage.local.set({ isRunning: false });
+      await stopAutomation();
+      console.log('[AutoHangout BG] Current topic mode completed, stopped in background');
+      return true;
+    }
+
+    settings = { ...settings, readMode: 'random' };
+    await chrome.storage.local.set({ settings });
+    await broadcastToContentScripts({ action: 'updateSettings', settings });
+  }
+
+  resetBackgroundListPlan();
+  await ensureTabPersistence(activeTabId);
+  await chrome.tabs.update(activeTabId, { url: 'https://linux.do/latest' });
+  console.log('[AutoHangout BG] Background topic completed, returning to latest');
+  return true;
+}
+
+async function advanceTopicInBackground(tab, now) {
+  if (!tab?.id || !tab.url) return false;
+  if (now - lastBackgroundTopicAdvanceAt < MIN_BACKGROUND_TOPIC_ADVANCE_MS) return false;
+
+  const ctx = parseTopicContextFromUrl(tab.url);
+  if (!ctx) return false;
+
+  const cached = topicProgressByTabId[tab.id];
+  if (!cached) return false;
+  if (cached.source === 'estimated' && (cached.total || 0) <= 20) return false;
+
+  const total = Math.max(cached?.total || 0, ctx.postNumber || 0);
+  const current = Math.max(cached?.current || 0, ctx.postNumber || 1);
+
+  if (!total || total <= 1) return false;
+
+  if (current >= Math.max(1, total - 1)) {
+    lastBackgroundTopicAdvanceAt = now;
+    return await finishBackgroundTopic(cached?.url || tab.url);
+  }
+
+  const step =
+    total >= 300 ? 25 :
+    total >= 150 ? 18 :
+    total >= 80 ? 12 :
+    8;
+  const nextPost = Math.min(total, Math.max(current + 1, current + step));
+  const nextUrl = buildTopicUrl(ctx.slug, ctx.topicId, nextPost);
+  if (!nextUrl || nextUrl === tab.url) return false;
+
+  lastBackgroundTopicAdvanceAt = now;
+  topicProgressByTabId[tab.id] = {
+    ...(cached || {}),
+    url: nextUrl,
+    topicId: ctx.topicId,
+    current: nextPost,
+    total,
+    at: now,
+    source: 'background-step'
+  };
+
+  await ensureTabPersistence(tab.id);
+  await chrome.tabs.update(tab.id, { url: nextUrl });
+  console.log('[AutoHangout BG] Advanced frozen topic in background:', nextUrl);
+  return true;
 }
 
 // ============ OFFSCREEN DOCUMENT ============
@@ -237,6 +410,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'topicCompleted':
       recordTopicCompleted(message);
+      sendResponse({ success: true });
+      break;
+
+    case 'topicProgress':
+      if (sender.tab?.id && typeof message.current === 'number' && typeof message.total === 'number') {
+        topicProgressByTabId[sender.tab.id] = {
+          url: typeof message.url === 'string' ? message.url : sender.tab.url,
+          topicId: message.topicId || parseTopicIdFromUrl(message.url || sender.tab.url || ''),
+          current: message.current,
+          total: message.total,
+          source: message.source || 'content',
+          at: Date.now()
+        };
+      }
       sendResponse({ success: true });
       break;
       
@@ -475,8 +662,22 @@ async function performDebuggerScroll(tabId, scrollAmount) {
       const result = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
         expression: `
           (function() {
-            window.scrollBy({ top: ${scrollAmount}, behavior: 'auto' });
-            return { scrollY: window.scrollY, scrolled: ${scrollAmount} };
+            const beforeY = window.scrollY;
+            const scroller = document.scrollingElement || document.documentElement || document.body;
+            const maxY = Math.max(0, (scroller?.scrollHeight || 0) - window.innerHeight);
+            if (scroller) {
+              scroller.scrollTop = Math.min(maxY, beforeY + ${scrollAmount});
+            } else {
+              window.scrollBy({ top: ${scrollAmount}, behavior: 'auto' });
+            }
+            window.dispatchEvent(new Event('scroll'));
+            const afterY = window.scrollY;
+            return {
+              beforeY,
+              afterY,
+              maxY,
+              atBottom: afterY >= Math.max(0, maxY - 2)
+            };
           })()
         `,
         returnByValue: true,
@@ -485,13 +686,30 @@ async function performDebuggerScroll(tabId, scrollAmount) {
 
       await sleep(50);
       const afterPageY = await getPageY(tabId);
+      const evalValue = result?.result?.value || {};
+      const effectiveBeforeY = beforePageY ?? evalValue.beforeY ?? null;
+      const effectiveAfterY = afterPageY ?? evalValue.afterY ?? null;
+      const atBottom = Boolean(evalValue.atBottom);
+
+      if (
+        effectiveBeforeY !== null &&
+        effectiveAfterY !== null &&
+        effectiveAfterY === effectiveBeforeY &&
+        !atBottom
+      ) {
+        throw new Error('eval_no_scroll');
+      }
 
       console.log('[AutoHangout BG] Eval scroll executed:', scrollAmount, 'px', {
         beforePageY,
         afterPageY,
-        result: result?.result?.value
+        result: evalValue
       });
-      return { success: true, method: 'eval' };
+      return {
+        success: true,
+        method: atBottom ? 'eval-bottom' : 'eval',
+        atBottom
+      };
     } catch (e2) {
       console.error('[AutoHangout BG] Eval scroll failed:', e2.message);
       if (
@@ -522,6 +740,7 @@ async function runScrollStep(trigger) {
       console.log('[AutoHangout BG] Tab invalid, skipping scroll');
       return;
     }
+    await ensureTabPersistence(activeTabId);
 
     try {
       const win = await chrome.windows.get(tab.windowId);
@@ -553,6 +772,24 @@ async function runScrollStep(trigger) {
       preferDebugger = true;
     }
 
+    const isTopicTab = /^https:\/\/linux\.do\/t\/[^/]+\/\d+/.test(tab.url);
+
+    if (preferDebugger && !isTopicTab) {
+      const navigated = await navigateToRandomTopicFromFeed(now);
+      if (navigated) {
+        lastScrollAt = now;
+      }
+      return;
+    }
+
+    if (preferDebugger && tab.frozen && isTopicTab) {
+      const advanced = await advanceTopicInBackground(tab, now);
+      if (advanced) {
+        lastScrollAt = now;
+        return;
+      }
+    }
+
     if (preferDebugger) {
       const result = await performDebuggerScroll(activeTabId, scrollAmount);
       if (result.success) {
@@ -565,6 +802,14 @@ async function runScrollStep(trigger) {
           settings
         });
         return;
+      }
+
+      if (isTopicTab) {
+        const advanced = await advanceTopicInBackground(tab, now);
+        if (advanced) {
+          lastScrollAt = now;
+          return;
+        }
       }
     }
 
@@ -609,6 +854,8 @@ async function runScrollStep(trigger) {
 // ============ AUTOMATION CONTROL ============
 async function startAutomation() {
   console.log('[AutoHangout BG] Starting automation');
+  resetBackgroundListPlan();
+  lastBackgroundTopicAdvanceAt = 0;
   
   // Setup offscreen document
   await setupOffscreen();
@@ -646,6 +893,7 @@ async function startAutomation() {
     }
   } catch (_) {}
   if (activeTabId) {
+    await ensureTabPersistence(activeTabId);
     await sendMessageToTab(activeTabId, { action: 'start', settings });
   }
   
@@ -688,7 +936,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   
   if (alarm.name === 'autoHangout-heartbeat') {
     console.log(`[AutoHangout BG] [${now}] Heartbeat`);
-    await broadcastToContentScripts({ action: 'heartbeat', settings });
+    const tab = activeTabId ? await chrome.tabs.get(activeTabId).catch(() => null) : null;
+    if (tab?.frozen) {
+      console.log('[AutoHangout BG] Active tab is frozen; skipping heartbeat message');
+    } else {
+      await broadcastToContentScripts({ action: 'heartbeat', settings });
+    }
   }
   
   if (alarm.name === 'autoHangout-keepalive') {
@@ -704,6 +957,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // Ensure debugger attached
     if (activeTabId && (!debuggerAttached || debuggerTabId !== activeTabId)) {
       await attachDebugger(activeTabId);
+    }
+    if (activeTabId) {
+      await ensureTabPersistence(activeTabId);
     }
   }
 });
@@ -741,6 +997,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (tabId === activeTabId || !activeTabId) {
       activeTabId = tabId;
       chrome.storage.local.set({ activeTabId });
+      await ensureTabPersistence(tabId);
       
       // Ensure debugger is attached to the active tab and start content script.
       await attachDebugger(tabId);
@@ -769,6 +1026,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  delete topicProgressByTabId[tabId];
   if (tabId === activeTabId) {
     console.log('[AutoHangout BG] Active tab closed');
     debuggerAttached = false;

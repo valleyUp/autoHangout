@@ -24,6 +24,8 @@
   let nextListNavigateTick = 0;
   let lastListNavigateAt = 0;
   let maxReadPercent = 0;
+  let lastTopicProgressReportAt = 0;
+  let lastTopicProgressKey = '';
   
   let settings = {
     scrollSpeed: 3,
@@ -151,6 +153,31 @@
     if (!topicId) return;
     const url = window.location.href;
     safeSendMessage({ action: 'topicCompleted', topicId, url, readPercent });
+  }
+
+  function reportTopicProgress(progress, force = false) {
+    const topicId = currentTopicId();
+    if (!topicId || !progress) return;
+
+    const current = Math.max(0, parseInt(progress.current, 10) || 0);
+    const total = Math.max(0, parseInt(progress.total, 10) || 0);
+    const key = `${topicId}:${current}/${total}:${progress.source || 'unknown'}`;
+    const now = Date.now();
+
+    if (!force && key === lastTopicProgressKey && now - lastTopicProgressReportAt < 5000) {
+      return;
+    }
+
+    lastTopicProgressKey = key;
+    lastTopicProgressReportAt = now;
+    safeSendMessage({
+      action: 'topicProgress',
+      topicId,
+      url: window.location.href,
+      current,
+      total,
+      source: progress.source || 'unknown'
+    });
   }
 
   function reportVisibility() {
@@ -340,6 +367,7 @@
         topicInfo = getTopicProgress();
         log('Topic info:', topicInfo);
         reportTopicVisited();
+        reportTopicProgress(topicInfo, true);
         initTopicPlan(topicInfo?.total || 0);
         
         // Only start local scrolling if visible
@@ -566,7 +594,9 @@
     if (newInfo.current > (topicInfo?.current || 0)) {
       topicInfo = newInfo;
     }
-    return topicInfo || newInfo;
+    const progress = topicInfo || newInfo;
+    reportTopicProgress(progress);
+    return progress;
   }
 
   function getTopicCompletionState(progress) {
