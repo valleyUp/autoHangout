@@ -17,6 +17,7 @@ let tabVisibilityStateById = {};
 let lastScrollAt = 0;
 
 const MIN_SCROLL_INTERVAL_MS = 2500;
+const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
 
 console.log('[AutoHangout BG] Service worker started (v2.3.2)');
 
@@ -435,7 +436,7 @@ async function performDebuggerScroll(tabId, scrollAmount) {
     const attached = await attachDebugger(tabId);
     if (!attached) {
       console.log('[AutoHangout BG] Cannot scroll - debugger not attached');
-      return false;
+      return { success: false, method: 'none', error: 'debugger_not_attached' };
     }
   }
   
@@ -493,18 +494,16 @@ async function performDebuggerScroll(tabId, scrollAmount) {
       return { success: true, method: 'eval' };
     } catch (e2) {
       console.error('[AutoHangout BG] Eval scroll failed:', e2.message);
+      if (
+        e2.message?.includes('not attached') ||
+        e2.message?.includes('No tab') ||
+        e2.message?.includes('Cannot access a chrome://')
+      ) {
+        debuggerAttached = false;
+        debuggerTabId = null;
+      }
+      return { success: false, method: 'none', error: e2?.message };
     }
-    
-    // If debugger was detached, mark it and try to reattach next time
-    if (
-      e.message?.includes('not attached') ||
-      e.message?.includes('No tab') ||
-      e.message?.includes('Cannot access a chrome://')
-    ) {
-      debuggerAttached = false;
-      debuggerTabId = null;
-    }
-    return { success: false, method: 'none', error: e?.message };
   }
 }
 
@@ -526,10 +525,12 @@ async function runScrollStep(trigger) {
 
     try {
       const win = await chrome.windows.get(tab.windowId);
+      const visibility = tabVisibilityStateById[activeTabId]?.visibilityState;
       const isForeground =
         tab.active &&
         win?.focused &&
-        win?.state !== 'minimized';
+        win?.state !== 'minimized' &&
+        visibility !== 'hidden';
 
       // If the user is actively viewing the target tab, don't fight them.
       if (isForeground) return;
@@ -540,21 +541,56 @@ async function runScrollStep(trigger) {
     const basePixels = 80 + settings.scrollSpeed * 30;
     const scrollAmount = Math.floor(basePixels * (0.7 + Math.random() * 0.6));
 
-    // Primary path: ask the content script to scroll in isolated world.
+    let preferDebugger = true;
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      preferDebugger =
+        !tab.active ||
+        !win?.focused ||
+        win?.state === 'minimized' ||
+        tabVisibilityStateById[activeTabId]?.visibilityState === 'hidden';
+    } catch (_) {
+      preferDebugger = true;
+    }
+
+    if (preferDebugger) {
+      const result = await performDebuggerScroll(activeTabId, scrollAmount);
+      if (result.success) {
+        lastScrollAt = now;
+        await sendMessageToTab(activeTabId, {
+          action: 'scrollPerformed',
+          scrollAmount,
+          method: result.method,
+          trigger,
+          settings
+        });
+        return;
+      }
+    }
+
+    // Foreground fallback: ask the content script to scroll in isolated world.
     const delivered = await sendMessageToTab(activeTabId, {
       action: 'doScroll',
       scrollAmount,
-      trigger
+      trigger,
+      settings
     });
     if (delivered) {
       lastScrollAt = now;
       return;
     }
 
-    // Fallback: attempt CDP scroll if messaging fails.
+    // Final fallback: attempt CDP scroll if messaging fails.
     const result = await performDebuggerScroll(activeTabId, scrollAmount);
     if (result.success) {
       lastScrollAt = now;
+      await sendMessageToTab(activeTabId, {
+        action: 'scrollPerformed',
+        scrollAmount,
+        method: result.method,
+        trigger,
+        settings
+      });
       return;
     }
 
@@ -580,22 +616,23 @@ async function startAutomation() {
   // Clear existing alarms
   await chrome.alarms.clearAll();
   
-  // Main scroll trigger - every 3 seconds
+  // Watchdog alarm: Chrome only guarantees 30s minimum periods for alarms.
+  // Fine-grained 3s ticks are driven by the offscreen document and active debugger session.
   chrome.alarms.create('autoHangout-scroll', { 
-    delayInMinutes: 0.05,
-    periodInMinutes: 0.05 
+    delayInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES,
+    periodInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES 
   });
   
-  // Heartbeat - every 15 seconds
+  // Heartbeat watchdog
   chrome.alarms.create('autoHangout-heartbeat', { 
-    delayInMinutes: 0.25,
-    periodInMinutes: 0.25 
+    delayInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES,
+    periodInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES 
   });
   
-  // Keep alive - every 20 seconds
+  // Keepalive watchdog
   chrome.alarms.create('autoHangout-keepalive', { 
-    delayInMinutes: 0.33,
-    periodInMinutes: 0.33 
+    delayInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES,
+    periodInMinutes: WATCHDOG_ALARM_PERIOD_MINUTES 
   });
   
   // Enforce single-target-tab behavior: stop other linux.do tabs, then start the target tab.
@@ -768,6 +805,7 @@ async function sendMessageToTab(tabId, message) {
       'heartbeat',
       'updateSettings',
       'doScroll',
+      'scrollPerformed',
       'scrollError'
     ]);
 
