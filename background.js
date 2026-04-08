@@ -4,7 +4,9 @@
 
 let isRunning = false;
 let settings = {
-  scrollSpeed: 3
+  scrollSpeed: 3,
+  readMode: 'random',
+  currentTopicAfterFinish: 'continueRandom'
 };
 let activeTabId = null;
 let debuggerAttached = false;
@@ -221,6 +223,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'updateSettings':
       if (message.settings) {
         settings = { ...settings, ...message.settings };
+        chrome.storage.local.set({ settings });
         broadcastToContentScripts({ action: 'updateSettings', settings });
       }
       sendResponse({ success: true });

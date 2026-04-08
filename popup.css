@@ -181,6 +181,27 @@ header h1 {
   color: #a1a1aa;
 }
 
+.setting-control select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #e4e4e7;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.setting-control select:focus {
+  border-color: rgba(96, 165, 250, 0.7);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.setting-control select option {
+  background: #1f2937;
+  color: #e5e7eb;
+}
+
 .info-section {
   margin-top: 16px;
   padding: 12px;

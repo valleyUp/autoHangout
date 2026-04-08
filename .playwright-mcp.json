@@ -1,0 +1,9 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "userDataDir": "/home/opc/autoHangout/.playwright-profile",
+    "launchOptions": {
+      "executablePath": "/usr/bin/chromium-browser"
+    }
+  }
+}

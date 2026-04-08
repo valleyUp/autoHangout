@@ -35,13 +35,33 @@
           <span id="scrollSpeedValue">3</span>
         </div>
       </div>
+
+      <div class="setting-item">
+        <label for="readMode">阅读模式</label>
+        <div class="setting-control">
+          <select id="readMode">
+            <option value="random">随机刷帖</option>
+            <option value="currentTopic">当前帖子读完</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-item" id="currentTopicAfterFinishGroup" hidden>
+        <label for="currentTopicAfterFinish">当前帖子读完后</label>
+        <div class="setting-control">
+          <select id="currentTopicAfterFinish">
+            <option value="continueRandom">返回首页继续随机阅读</option>
+            <option value="stop">直接停止</option>
+          </select>
+        </div>
+      </div>
     </div>
 
     <div class="info-section">
       <h3>📖 阅读规则</h3>
       <ul>
-        <li>退出阈值会根据帖子长度自动生成</li>
-        <li>读完自动返回帖子列表并继续</li>
+        <li>随机模式会从帖子列表随机选帖并循环阅读</li>
+        <li>当前帖子模式会优先把当前主题帖读完</li>
       </ul>
     </div>
 

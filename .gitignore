@@ -1,1 +1,6 @@
 tmp/
+.playwright-profile/
+.playwright-mcp/
+.serena/
+.codex
+cookies.txt

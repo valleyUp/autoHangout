@@ -26,7 +26,9 @@
   let maxReadPercent = 0;
   
   let settings = {
-    scrollSpeed: 3
+    scrollSpeed: 3,
+    readMode: 'random',
+    currentTopicAfterFinish: 'continueRandom'
   };
 
   const TOPIC_HISTORY_KEY = 'topicHistory';
@@ -158,6 +160,18 @@
     });
   }
 
+  function updateLocalSettings(nextSettings) {
+    settings = { ...settings, ...nextSettings };
+  }
+
+  function persistSettings(nextSettings) {
+    updateLocalSettings(nextSettings);
+    safeSendMessage({
+      action: 'updateSettings',
+      settings: nextSettings
+    });
+  }
+
   reportVisibility();
 
   // ============ MESSAGE HANDLING ============
@@ -165,7 +179,7 @@
     log('Message:', message.action);
     
     if (message.action === 'start') {
-      if (message.settings) settings = message.settings;
+      if (message.settings) updateLocalSettings(message.settings);
       start();
     } else if (message.action === 'stop') {
       stop();
@@ -175,7 +189,7 @@
         return true;
       }
 
-      if (message.settings) settings = { ...settings, ...message.settings };
+      if (message.settings) updateLocalSettings(message.settings);
 
       const amount = typeof message.scrollAmount === 'number'
         ? message.scrollAmount
@@ -194,9 +208,9 @@
         maybeNavigateFromList(message.trigger);
       }
     } else if (message.action === 'updateSettings') {
-      if (message.settings) settings = { ...settings, ...message.settings };
+      if (message.settings) updateLocalSettings(message.settings);
     } else if (message.action === 'heartbeat') {
-      if (message.settings) settings = { ...settings, ...message.settings };
+      if (message.settings) updateLocalSettings(message.settings);
       if (!isRunning) {
         // Background decides which tab should run; don't auto-start on heartbeat.
         sendResponse({ success: true });
@@ -215,7 +229,7 @@
         scrollCount++;
         lastActivityTime = Date.now();
         log(`[BG Scroll] #${scrollCount}: ${message.scrollAmount}px (${message.method || 'unknown'})`);
-        if (message.settings) settings = { ...settings, ...message.settings };
+        if (message.settings) updateLocalSettings(message.settings);
         
         const pageType = getPageType();
         if (pageType === 'topic') {
@@ -255,13 +269,14 @@
 
   // Load settings (start/stop is driven by background to enforce single-target-tab behavior)
   safeStorageGet(['settings'], (data) => {
-    if (data.settings) settings = { ...settings, ...data.settings };
+    if (data.settings) updateLocalSettings(data.settings);
   });
 
   // Per-topic exit plan (derived automatically; no UI probability knob)
   let topicExitTargetPercent = null;
   let topicMinScrolls = 0;
   let topicStartedAt = 0;
+  let topicCompletionSeenAt = 0;
 
   function computeExitTargetPercent(totalPosts) {
     const roll = Math.random();
@@ -275,8 +290,16 @@
   function initTopicPlan(totalPosts) {
     topicStartedAt = Date.now();
     topicExitTargetPercent = computeExitTargetPercent(totalPosts || 0);
-    // Ensure we don't bounce instantly on very short pages.
-    topicMinScrolls = 8 + Math.floor(Math.random() * 7); // 8-14
+    topicCompletionSeenAt = 0;
+
+    if (totalPosts >= 100) {
+      topicMinScrolls = 22 + Math.floor(Math.random() * 10); // 22-31
+    } else if (totalPosts >= 50) {
+      topicMinScrolls = 16 + Math.floor(Math.random() * 8); // 16-23
+    } else {
+      // Ensure we don't bounce instantly on very short pages.
+      topicMinScrolls = 8 + Math.floor(Math.random() * 7); // 8-14
+    }
     log(`[Plan] target=${topicExitTargetPercent}% minScrolls=${topicMinScrolls}`);
   }
 
@@ -296,11 +319,24 @@
     
     const pageType = getPageType();
     log('Starting, page:', pageType, 'background:', isBackgroundMode);
+
+    if (settings.readMode === 'random' && pageType === 'topic') {
+      log('Random mode starts from /latest, leaving current topic page');
+      requestNavigation(window.location.origin + '/latest');
+      return;
+    }
+
+    if (settings.readMode === 'currentTopic' && pageType !== 'topic') {
+      log('Current topic mode requires a topic page, falling back to random mode');
+      persistSettings({ readMode: 'random' });
+    }
     
     setTimeout(() => {
       if (!isRunning) return;
       
-      if (pageType === 'topic') {
+      const effectivePageType = getPageType();
+
+      if (effectivePageType === 'topic') {
         topicInfo = getTopicProgress();
         log('Topic info:', topicInfo);
         reportTopicVisited();
@@ -533,28 +569,95 @@
     return topicInfo || newInfo;
   }
 
+  function getTopicCompletionState(progress) {
+    const doc = document.documentElement;
+    const scrollTop = window.scrollY || doc.scrollTop || 0;
+    const viewportBottom = scrollTop + window.innerHeight;
+    const scrollHeight = Math.max(
+      doc.scrollHeight || 0,
+      document.body?.scrollHeight || 0,
+      1
+    );
+    const distanceToBottom = Math.max(0, scrollHeight - viewportBottom);
+    const nearBottom = distanceToBottom <= 180;
+
+    const posts = Array.from(document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]'));
+    let maxLoadedPostNumber = 0;
+    for (const post of posts) {
+      const postNumber = parseInt(post.getAttribute('data-post-number') || '', 10);
+      if (Number.isFinite(postNumber) && postNumber > maxLoadedPostNumber) {
+        maxLoadedPostNumber = postNumber;
+      }
+    }
+
+    const total = progress?.total || 0;
+    const observedCurrent = Math.max(progress?.current || 0, maxLoadedPostNumber);
+    const nearTail = total > 0
+      ? observedCurrent >= Math.max(1, total - 1)
+      : nearBottom;
+    const finishCandidate = nearBottom && nearTail;
+
+    if (finishCandidate) {
+      if (!topicCompletionSeenAt) topicCompletionSeenAt = Date.now();
+    } else {
+      topicCompletionSeenAt = 0;
+    }
+
+    const requiredStableMs = total >= 100 ? 12000 : total >= 50 ? 8000 : 4000;
+    const stableForMs = topicCompletionSeenAt ? Date.now() - topicCompletionSeenAt : 0;
+
+    return {
+      distanceToBottom,
+      nearBottom,
+      nearTail,
+      observedCurrent,
+      maxLoadedPostNumber,
+      finishCandidate,
+      finishStable: finishCandidate && stableForMs >= requiredStableMs,
+      stableForMs,
+      requiredStableMs
+    };
+  }
+
   // ============ EXIT STRATEGY ============
   function shouldExitTopic() {
     const progress = updateProgress();
     const total = progress.total;
     const current = progress.current;
     const readPercent = total > 0 ? (current / total) * 100 : 0;
+    const completion = getTopicCompletionState(progress);
     
-    log(`Progress: ${current}/${total} (${readPercent.toFixed(0)}%), scrolls: ${scrollCount}, stuck: ${stuckCount}`);
+    log(
+      `Progress: ${current}/${total} (${readPercent.toFixed(0)}%), ` +
+      `tail=${completion.observedCurrent}/${total}, bottom=${completion.distanceToBottom}px, ` +
+      `scrolls: ${scrollCount}, stuck: ${stuckCount}`
+    );
 
     if (topicExitTargetPercent === null) {
       initTopicPlan(total || 0);
     }
     
-    // Long topic (>= 50): read most of it
-    if (total >= 50) {
-      const target = Math.max(90, topicExitTargetPercent ?? 90);
-      if (readPercent >= target && scrollCount >= topicMinScrolls) {
-        log(`Long topic: read ${target}%+, exiting`);
+    // Mega topic (>= 100): only leave after we have clearly reached the tail.
+    if (total >= 100) {
+      if (completion.finishStable && scrollCount >= topicMinScrolls) {
+        log('Mega topic: reached tail and bottom, exiting');
         return true;
       }
-      if (stuckCount >= 20 && readPercent >= 70) {
-        log('Long topic: stuck, seems finished');
+      if (completion.nearBottom && stuckCount >= 30 && readPercent >= 98 && scrollCount >= topicMinScrolls) {
+        log('Mega topic: stuck near bottom, exiting');
+        return true;
+      }
+      return false;
+    }
+
+    // Long topic (50-99): still prefer finishing the thread before leaving.
+    if (total >= 50) {
+      if (completion.finishStable && scrollCount >= topicMinScrolls) {
+        log('Long topic: reached tail and bottom, exiting');
+        return true;
+      }
+      if (completion.nearBottom && stuckCount >= 22 && readPercent >= 95 && scrollCount >= topicMinScrolls) {
+        log('Long topic: stuck near bottom, exiting');
         return true;
       }
       return false;
@@ -562,32 +665,41 @@
     
     // Medium topic (20-49): read most of it
     if (total >= 20) {
-      const target = Math.max(80, topicExitTargetPercent ?? 80);
-      if (readPercent >= target && scrollCount >= topicMinScrolls) {
-        log(`Medium topic: read ${target}%+, exiting`);
+      const target = Math.max(85, topicExitTargetPercent ?? 85);
+      if (completion.finishStable && scrollCount >= topicMinScrolls) {
+        log('Medium topic: reached tail and bottom, exiting');
         return true;
       }
-      if (stuckCount >= 15 && readPercent >= 60) {
-        log('Medium topic: stuck, seems finished');
+      if (completion.nearBottom && readPercent >= target && scrollCount >= topicMinScrolls) {
+        log(`Medium topic: near bottom after reading ${target}%+, exiting`);
+        return true;
+      }
+      if (completion.nearBottom && stuckCount >= 16 && readPercent >= 80) {
+        log('Medium topic: stuck near bottom, exiting');
         return true;
       }
       return false;
     }
     
     // Short topic (< 20): auto-derived threshold + minimum engagement
-    if (readPercent >= (topicExitTargetPercent ?? 80) && scrollCount >= topicMinScrolls) {
-      log(`Short topic: read ${topicExitTargetPercent}%+, exiting`);
+    if (completion.finishStable && scrollCount >= Math.max(6, topicMinScrolls - 2)) {
+      log('Short topic: reached tail and bottom, exiting');
+      return true;
+    }
+
+    if (completion.nearBottom && readPercent >= (topicExitTargetPercent ?? 80) && scrollCount >= topicMinScrolls) {
+      log(`Short topic: near bottom after reading ${topicExitTargetPercent}%+, exiting`);
       return true;
     }
     
-    if (stuckCount >= 10 && scrollCount >= 15) {
-      log('Short topic: stuck, exiting');
+    if (completion.nearBottom && stuckCount >= 10 && scrollCount >= 12) {
+      log('Short topic: stuck near bottom, exiting');
       return true;
     }
     
     // Safety: if we have been reading for a long time and reached a decent point, allow exit.
-    if (Date.now() - topicStartedAt > 4 * 60 * 1000 && readPercent >= 70) {
-      log('Short topic: time limit reached, exiting');
+    if (Date.now() - topicStartedAt > 4 * 60 * 1000 && completion.nearBottom && readPercent >= 70) {
+      log('Short topic: time limit reached near bottom, exiting');
       return true;
     }
 
@@ -688,6 +800,18 @@
       ? Math.max(0, Math.min(100, (progress.current / progress.total) * 100))
       : getReadPercentByScroll();
     reportTopicCompleted(readPercent);
+
+    if (settings.readMode === 'currentTopic') {
+      if (settings.currentTopicAfterFinish === 'stop') {
+        log('Current topic mode completed, stopping');
+        stop();
+        safeSendMessage({ action: 'stop' });
+        return;
+      }
+
+      log('Current topic mode completed, switching back to random mode');
+      persistSettings({ readMode: 'random' });
+    }
     
     // Always return to list after finishing a topic, then pick a new one from list.
     const targetUrl = window.location.origin + '/latest';
