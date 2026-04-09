@@ -35,6 +35,7 @@
 
   const TOPIC_HISTORY_KEY = 'topicHistory';
   const VISITED_CACHE_TTL_MS = 15000;
+  const MAX_TRUSTED_PROGRESS_LEAD = 60;
   let visitedTopicIds = new Set();
   let visitedCacheLoadedAt = 0;
   let visitedCacheLoading = false;
@@ -537,52 +538,92 @@
   }
 
   // ============ TOPIC PROGRESS ============
+  function getMaxLoadedPostNumber() {
+    const posts = document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]');
+    let maxLoadedPostNumber = 0;
+
+    for (const post of posts) {
+      const rawPostNumber =
+        post.getAttribute('data-post-number') ||
+        post.dataset?.postNumber ||
+        '';
+      const postNumber = parseInt(rawPostNumber, 10);
+      if (Number.isFinite(postNumber) && postNumber > maxLoadedPostNumber) {
+        maxLoadedPostNumber = postNumber;
+      }
+    }
+
+    return maxLoadedPostNumber;
+  }
+
   function getTopicProgress() {
+    const candidates = [];
+    let total = 0;
+    let urlPostNumber = 0;
+
     const timeline = document.querySelector('.timeline-replies');
     if (timeline) {
       const match = timeline.textContent.match(/(\d+)\s*\/\s*(\d+)/);
       if (match) {
-        return { current: parseInt(match[1]), total: parseInt(match[2]), source: 'timeline' };
+        const timelineCurrent = parseInt(match[1], 10);
+        const timelineTotal = parseInt(match[2], 10);
+        candidates.push({ source: 'timeline', current: timelineCurrent });
+        total = Math.max(total, timelineTotal);
       }
     }
     
     const urlMatch = window.location.pathname.match(/\/t\/[^/]+\/\d+\/(\d+)/);
     if (urlMatch) {
-      const postNum = parseInt(urlMatch[1]);
-      const posts = document.querySelectorAll('.topic-post, article[data-post-number]');
-      return { current: postNum, total: Math.max(postNum, posts.length, 20), source: 'url' };
+      urlPostNumber = parseInt(urlMatch[1], 10);
+      candidates.push({ source: 'url', current: urlPostNumber });
+      total = Math.max(total, urlPostNumber);
     }
-    
-    const posts = document.querySelectorAll('.topic-post, article[data-post-number]');
-    return { current: 1, total: Math.max(posts.length, 20), source: 'estimated' };
+
+    const maxLoadedPostNumber = getMaxLoadedPostNumber();
+    if (maxLoadedPostNumber > 0) {
+      candidates.push({ source: 'dom', current: maxLoadedPostNumber });
+      total = Math.max(total, maxLoadedPostNumber);
+    }
+
+    const posts = document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]');
+    total = Math.max(total, posts.length, 20);
+
+    const anchorCurrent =
+      urlPostNumber ||
+      candidates.find((candidate) => candidate.source === 'timeline')?.current ||
+      maxLoadedPostNumber ||
+      0;
+    const trustedCandidates = candidates.filter((candidate) => {
+      if (!anchorCurrent) return true;
+      return candidate.current <= anchorCurrent + MAX_TRUSTED_PROGRESS_LEAD;
+    });
+    const sourceParts = trustedCandidates.map((candidate) => candidate.source);
+    const current = Math.max(
+      anchorCurrent,
+      ...trustedCandidates.map((candidate) => candidate.current)
+    );
+
+    if (current > 0) {
+      return {
+        current,
+        total,
+        source: sourceParts.join('+') || 'dom'
+      };
+    }
+
+    return { current: 1, total, source: 'estimated' };
   }
 
   function updateProgress() {
     const newInfo = getTopicProgress();
-
-    const readPercentByScroll = getReadPercentByScroll();
-    const totalPosts = Math.max(
+    newInfo.total = Math.max(
       newInfo.total || 0,
       topicInfo?.total || 0
     );
 
-    // Discourse 在 hidden 状态下经常不更新 timeline/url post number；
-    // 用滚动百分比估算 current，保证进度可推进并触发退出。
-    if (totalPosts > 0) {
-      const estimatedCurrent = Math.max(1, Math.min(
-        totalPosts,
-        Math.round((totalPosts * readPercentByScroll) / 100)
-      ));
-      if (estimatedCurrent > newInfo.current) {
-        newInfo.current = estimatedCurrent;
-        newInfo.total = totalPosts;
-        newInfo.source = `${newInfo.source}+scroll`;
-      }
-    } else {
-      newInfo.current = Math.max(newInfo.current, Math.round(readPercentByScroll));
-      newInfo.total = 100;
-      newInfo.source = `${newInfo.source}+scroll`;
-    }
+    // Never map page scroll percentage to an absolute post number.
+    // Discourse topic height is not linear with post ids, especially on long threads,
+    // and that causes catastrophic jumps such as 200 -> 2000+.
     
     if (newInfo.current > lastProgress) {
       stuckCount = 0;

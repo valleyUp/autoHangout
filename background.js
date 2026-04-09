@@ -24,6 +24,7 @@ let lastBackgroundTopicAdvanceAt = 0;
 const MIN_SCROLL_INTERVAL_MS = 2500;
 const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
 const MIN_BACKGROUND_TOPIC_ADVANCE_MS = 12000;
+const MAX_TRUSTED_PROGRESS_LEAD = 60;
 
 console.log('[AutoHangout BG] Service worker started (v2.3.2)');
 
@@ -67,6 +68,37 @@ function buildTopicUrl(slug, topicId, postNumber) {
     return `https://linux.do/t/${safeSlug}/${topicId}`;
   }
   return `https://linux.do/t/${safeSlug}/${topicId}/${postNumber}`;
+}
+
+function isReliableTopicProgressSource(source) {
+  const text = String(source || '').toLowerCase();
+  if (!text) return false;
+  return text.includes('timeline') || text.includes('url') || text.includes('dom');
+}
+
+function getTrustedCachedTopicCurrent(cached, ctx) {
+  if (!isReliableTopicProgressSource(cached?.source)) return 0;
+
+  const cachedCurrent = Math.max(0, parseInt(cached?.current, 10) || 0);
+  const currentPost = Math.max(1, ctx?.postNumber || 1);
+  if (!cachedCurrent) return 0;
+
+  // Content-script progress may drift slightly ahead of the canonical URL while
+  // the page is still settling, but anything far beyond that is untrustworthy.
+  if (cachedCurrent > currentPost + MAX_TRUSTED_PROGRESS_LEAD) {
+    console.warn(
+      '[AutoHangout BG] Ignoring suspicious cached topic progress:',
+      JSON.stringify({
+        topicId: ctx?.topicId,
+        currentPost,
+        cachedCurrent,
+        source: cached?.source
+      })
+    );
+    return 0;
+  }
+
+  return cachedCurrent;
 }
 
 function touchHistoryOrder(topicId) {
@@ -277,6 +309,7 @@ async function advanceTopicInBackground(tab, now) {
   }
 
   const cached = topicProgressByTabId[tab.id] || {};
+  const cachedCurrent = getTrustedCachedTopicCurrent(cached, ctx);
   const total = Math.max(
     fetched?.total || 0,
     cached?.total || 0,
@@ -284,7 +317,7 @@ async function advanceTopicInBackground(tab, now) {
   );
   const current = Math.max(
     fetched?.current || 0,
-    cached?.current || 0,
+    cachedCurrent,
     ctx.postNumber || 1
   );
 
