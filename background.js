@@ -20,10 +20,12 @@ let backgroundTopicStateByTabId = {};
 let backgroundListTickCount = 0;
 let backgroundNextListNavigateTick = 0;
 let lastBackgroundListNavigateAt = 0;
+let lastBackgroundTopicAdvanceAt = 0;
 let stateLoadPromise = null;
 
 const MIN_SCROLL_INTERVAL_MS = 2500;
 const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
+const MIN_BACKGROUND_TOPIC_ADVANCE_MS = 12000;
 const MIN_TOPIC_VISIBLE_POST_HEIGHT = 48;
 const MIN_BACKGROUND_RECOVERY_STALL_MS = 45000;
 const BACKGROUND_RECOVERY_COOLDOWN_MS = 90000;
@@ -300,6 +302,40 @@ async function fetchLatestTopicPool() {
     .filter((topic) => Boolean(topic.url));
 }
 
+async function fetchTopicState(urlOrContext) {
+  const ctx = typeof urlOrContext === 'string'
+    ? parseTopicContextFromUrl(urlOrContext)
+    : urlOrContext;
+  if (!ctx?.topicId) return null;
+
+  const apiUrl = `https://linux.do/t/${ctx.slug || '-'}/${ctx.topicId}.json`;
+  const response = await fetch(apiUrl, {
+    credentials: 'include',
+    cache: 'no-store'
+  });
+  if (!response.ok) {
+    throw new Error(`topic_fetch_failed:${response.status}`);
+  }
+
+  const data = await response.json();
+  const slug = data?.slug || ctx.slug || '-';
+  const topicId = String(data?.id || ctx.topicId);
+  const highestPostNumber = Math.max(
+    data?.highest_post_number || 0,
+    data?.posts_count || 0,
+    ctx.postNumber || 0
+  );
+
+  return {
+    slug,
+    topicId,
+    total: highestPostNumber,
+    current: Math.max(1, ctx.postNumber || 1),
+    url: buildTopicUrl(slug, topicId, ctx.postNumber || 1),
+    source: 'topic-json'
+  };
+}
+
 async function navigateToRandomTopicFromFeed(now) {
   if (!activeTabId) return false;
 
@@ -361,6 +397,81 @@ async function finishBackgroundTopic(url) {
   await ensureTabPersistence(activeTabId);
   await chrome.tabs.update(activeTabId, { url: 'https://linux.do/latest' });
   console.log('[AutoHangout BG] Background topic completed, returning to latest');
+  return true;
+}
+
+async function advanceTopicInBackground(tab, now) {
+  if (!tab?.id || !tab.url) return false;
+  if (now - lastBackgroundTopicAdvanceAt < MIN_BACKGROUND_TOPIC_ADVANCE_MS) return false;
+
+  const ctx = parseTopicContextFromUrl(tab.url);
+  if (!ctx) return false;
+
+  let fetched;
+  try {
+    fetched = await fetchTopicState(ctx);
+  } catch (e) {
+    console.warn('[AutoHangout BG] Failed to fetch topic state:', e?.message || String(e));
+    fetched = null;
+  }
+
+  const cached = topicProgressByTabId[tab.id] || {};
+  const total = Math.max(
+    fetched?.total || 0,
+    cached?.total || 0,
+    ctx.postNumber || 0
+  );
+  const current = Math.max(
+    fetched?.current || 0,
+    cached?.current || 0,
+    ctx.postNumber || 1
+  );
+
+  if (!total || total <= 1) return false;
+
+  if (current >= Math.max(1, total - 1)) {
+    lastBackgroundTopicAdvanceAt = now;
+    return await finishBackgroundTopic(fetched?.url || cached?.url || tab.url);
+  }
+
+  const step =
+    total >= 300 ? 25 :
+    total >= 150 ? 18 :
+    total >= 80 ? 12 :
+    8;
+  const nextPost = Math.min(total, Math.max(current + 1, current + step));
+  const nextUrl = buildTopicUrl(
+    fetched?.slug || ctx.slug,
+    fetched?.topicId || ctx.topicId,
+    nextPost
+  );
+  if (!nextUrl || nextUrl === tab.url) return false;
+
+  lastBackgroundTopicAdvanceAt = now;
+  topicProgressByTabId[tab.id] = {
+    ...cached,
+    ...(fetched || {}),
+    url: nextUrl,
+    topicId: String(fetched?.topicId || ctx.topicId),
+    current: nextPost,
+    total,
+    furthestSeen: Math.max(cached?.furthestSeen || 0, current, nextPost),
+    maxLoaded: Math.max(cached?.maxLoaded || 0, current, nextPost),
+    minLoaded: Math.max(1, cached?.minLoaded || 1),
+    at: now,
+    source: 'background-json'
+  };
+  backgroundTopicStateByTabId[tab.id] = {
+    ...(backgroundTopicStateByTabId[tab.id] || {}),
+    ...(topicProgressByTabId[tab.id]),
+    at: now,
+    lastProgressAt: now,
+    stalledSince: 0
+  };
+
+  await ensureTabPersistence(tab.id);
+  await chrome.tabs.update(tab.id, { url: nextUrl });
+  console.log('[AutoHangout BG] Advanced topic in background:', nextUrl);
   return true;
 }
 
@@ -1007,33 +1118,11 @@ async function runScrollStep(trigger) {
     }
 
     if (!isForeground && isTopicTab) {
-      const result = await performDebuggerScroll(activeTabId, scrollAmount);
-      const probe = await probeTopicProgressViaDebugger(activeTabId);
-      const cached = probe
-        ? cacheTopicProgressForTab(activeTabId, probe, {
-            url: tab.url,
-            topicId: parseTopicIdFromUrl(tab.url),
-            source: 'debugger-dom'
-          })
-        : topicProgressByTabId[activeTabId] || null;
-      const state = cached ? updateBackgroundTopicState(activeTabId, cached, now) : null;
-
-      if (cached && shouldFinishTopicFromProbe(cached, state, now)) {
+      const advanced = await advanceTopicInBackground(tab, now);
+      if (advanced) {
         lastScrollAt = now;
-        await finishBackgroundTopic(cached.url || tab.url);
-        return;
       }
-
-      const recovered = await maybeRecoverStalledTopic(tab, cached, result, now);
-      if (recovered) {
-        lastScrollAt = now;
-        return;
-      }
-
-      if (result.success) {
-        lastScrollAt = now;
-        return;
-      }
+      return;
     }
 
     // Foreground path: ask the content script to scroll in isolated world.
@@ -1084,6 +1173,7 @@ async function runScrollStep(trigger) {
 async function startAutomation() {
   console.log('[AutoHangout BG] Starting automation');
   resetBackgroundListPlan();
+  lastBackgroundTopicAdvanceAt = 0;
   backgroundTopicStateByTabId = {};
   
   // Setup offscreen document
