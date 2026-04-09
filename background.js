@@ -20,6 +20,7 @@ let backgroundTopicStateByTabId = {};
 let backgroundListTickCount = 0;
 let backgroundNextListNavigateTick = 0;
 let lastBackgroundListNavigateAt = 0;
+let stateLoadPromise = null;
 
 const MIN_SCROLL_INTERVAL_MS = 2500;
 const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
@@ -235,6 +236,39 @@ function resetBackgroundListPlan() {
   backgroundNextListNavigateTick = 3 + Math.floor(Math.random() * 6);
 }
 
+async function ensureStateLoaded() {
+  if (!stateLoadPromise) {
+    stateLoadPromise = (async () => {
+      try {
+        const data = await chrome.storage.local.get([
+          'isRunning',
+          'settings',
+          'activeTabId',
+          TOPIC_HISTORY_KEY
+        ]);
+
+        console.log('[AutoHangout BG] Loaded state:', data);
+        isRunning = data.isRunning || false;
+        activeTabId = typeof data.activeTabId === 'number' ? data.activeTabId : null;
+        if (data.settings) {
+          settings = { ...settings, ...data.settings };
+        }
+        if (data[TOPIC_HISTORY_KEY]) {
+          topicHistory = ensureTopicHistoryShape(data[TOPIC_HISTORY_KEY]);
+        }
+
+        if (isRunning && activeTabId) {
+          await startAutomation();
+        }
+      } catch (e) {
+        console.error('[AutoHangout BG] Failed to load state:', e?.message || String(e));
+      }
+    })();
+  }
+
+  return stateLoadPromise;
+}
+
 async function ensureTabPersistence(tabId) {
   if (typeof tabId !== 'number') return;
   try {
@@ -366,21 +400,7 @@ async function setupOffscreen() {
 }
 
 // ============ INITIALIZATION ============
-chrome.storage.local.get(['isRunning', 'settings', 'activeTabId', TOPIC_HISTORY_KEY], (data) => {
-  console.log('[AutoHangout BG] Loaded state:', data);
-  isRunning = data.isRunning || false;
-  activeTabId = data.activeTabId || null;
-  if (data.settings) {
-    settings = { ...settings, ...data.settings };
-  }
-  if (data[TOPIC_HISTORY_KEY]) {
-    topicHistory = ensureTopicHistoryShape(data[TOPIC_HISTORY_KEY]);
-  }
-  
-  if (isRunning && activeTabId) {
-    startAutomation();
-  }
-});
+void ensureStateLoaded();
 
 chrome.runtime.onInstalled.addListener((details) => {
   // For first-time install, auto-start browsing when a linux.do tab exists.
@@ -423,153 +443,162 @@ function normalizeLinuxDoUrl(rawUrl) {
 
 // ============ MESSAGE HANDLING ============
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log('[AutoHangout BG] Message:', message.action);
-  
-  switch (message.action) {
-    case 'start':
-      isRunning = true;
-      if (message.settings) {
-        settings = message.settings;
-      }
-      if (typeof message.tabId === 'number') {
-        activeTabId = message.tabId;
-        chrome.storage.local.set({ activeTabId });
-      } else if (sender.tab) {
-        activeTabId = sender.tab.id;
-        chrome.storage.local.set({ activeTabId });
-      }
-      chrome.storage.local.set({ isRunning, settings, activeTabId });
-      startAutomation();
-      sendResponse({ success: true });
-      break;
-      
-    case 'stop':
-      isRunning = false;
-      chrome.storage.local.set({ isRunning: false });
-      stopAutomation();
-      sendResponse({ success: true });
-      break;
-      
-    case 'updateSettings':
-      if (message.settings) {
-        settings = { ...settings, ...message.settings };
-        chrome.storage.local.set({ settings });
-        broadcastToContentScripts({ action: 'updateSettings', settings });
-      }
-      sendResponse({ success: true });
-      break;
+  (async () => {
+    await ensureStateLoaded();
+    console.log('[AutoHangout BG] Message:', message.action);
 
-    case 'topicVisited':
-      if (typeof message.url === 'string') recordTopicSeen(message.url);
-      sendResponse({ success: true });
-      break;
+    switch (message.action) {
+      case 'start':
+        isRunning = true;
+        if (message.settings) {
+          settings = message.settings;
+        }
+        if (typeof message.tabId === 'number') {
+          activeTabId = message.tabId;
+          chrome.storage.local.set({ activeTabId });
+        } else if (sender.tab) {
+          activeTabId = sender.tab.id;
+          chrome.storage.local.set({ activeTabId });
+        }
+        await chrome.storage.local.set({ isRunning, settings, activeTabId });
+        await startAutomation();
+        sendResponse({ success: true });
+        return;
 
-    case 'topicCompleted':
-      recordTopicCompleted(message);
-      sendResponse({ success: true });
-      break;
+      case 'stop':
+        isRunning = false;
+        await chrome.storage.local.set({ isRunning: false });
+        await stopAutomation();
+        sendResponse({ success: true });
+        return;
 
-    case 'topicProgress':
-      if (sender.tab?.id && typeof message.current === 'number' && typeof message.total === 'number') {
-        const cached = cacheTopicProgressForTab(sender.tab.id, {
-          url: typeof message.url === 'string' ? message.url : sender.tab.url,
-          topicId: message.topicId || parseTopicIdFromUrl(message.url || sender.tab.url || ''),
-          current: message.current,
-          total: message.total,
-          furthestSeen: message.furthestSeen,
-          maxLoaded: message.maxLoaded,
-          minLoaded: message.minLoaded,
-          distanceToBottom: message.distanceToBottom,
-          source: message.source || 'content',
-          at: Date.now()
-        });
-        updateBackgroundTopicState(sender.tab.id, cached, Date.now());
-      }
-      sendResponse({ success: true });
-      break;
-      
-    case 'getState':
-      sendResponse({ isRunning, settings });
-      break;
-      
-    case 'tabReady':
-      if (sender.tab) {
-        const tabId = sender.tab.id;
-        const shouldAdoptTab =
-          !isRunning ||
-          !activeTabId ||
-          activeTabId === tabId;
+      case 'updateSettings':
+        if (message.settings) {
+          settings = { ...settings, ...message.settings };
+          await chrome.storage.local.set({ settings });
+          await broadcastToContentScripts({ action: 'updateSettings', settings });
+        }
+        sendResponse({ success: true });
+        return;
 
-        if (shouldAdoptTab) {
-          activeTabId = tabId;
+      case 'topicVisited':
+        if (typeof message.url === 'string') recordTopicSeen(message.url);
+        sendResponse({ success: true });
+        return;
+
+      case 'topicCompleted':
+        recordTopicCompleted(message);
+        sendResponse({ success: true });
+        return;
+
+      case 'topicProgress':
+        if (sender.tab?.id && typeof message.current === 'number' && typeof message.total === 'number') {
+          const cached = cacheTopicProgressForTab(sender.tab.id, {
+            url: typeof message.url === 'string' ? message.url : sender.tab.url,
+            topicId: message.topicId || parseTopicIdFromUrl(message.url || sender.tab.url || ''),
+            current: message.current,
+            total: message.total,
+            furthestSeen: message.furthestSeen,
+            maxLoaded: message.maxLoaded,
+            minLoaded: message.minLoaded,
+            distanceToBottom: message.distanceToBottom,
+            source: message.source || 'content',
+            at: Date.now()
+          });
+          updateBackgroundTopicState(sender.tab.id, cached, Date.now());
+        }
+        sendResponse({ success: true });
+        return;
+
+      case 'getState':
+        sendResponse({ isRunning, settings });
+        return;
+
+      case 'tabReady':
+        if (sender.tab) {
+          const tabId = sender.tab.id;
+          const shouldAdoptTab =
+            !isRunning ||
+            !activeTabId ||
+            activeTabId === tabId;
+
+          if (shouldAdoptTab) {
+            activeTabId = tabId;
+            chrome.storage.local.set({ activeTabId });
+          }
+
+          if (isRunning && activeTabId === tabId) {
+            chrome.tabs.sendMessage(tabId, {
+              action: 'start',
+              settings,
+              startMode: 'navigation'
+            }).catch(() => {});
+            await attachDebugger(tabId);
+          }
+        }
+        sendResponse({ success: true });
+        return;
+
+      case 'tabVisibility':
+        if (sender.tab && typeof message.visibilityState === 'string') {
+          tabVisibilityStateById[sender.tab.id] = {
+            visibilityState: message.visibilityState,
+            at: Date.now()
+          };
+        }
+        sendResponse({ success: true });
+        return;
+
+      case 'offscreenPing':
+        sendResponse({ alive: true });
+        return;
+
+      case 'offscreenTick':
+        runScrollStep('offscreen').catch(() => {});
+        sendResponse({ success: true });
+        return;
+
+      case 'requestNavigation':
+        if (!sender.tab) {
+          sendResponse({ success: false, error: 'no_sender_tab' });
+          return;
+        }
+
+        if (!message.url) {
+          sendResponse({ success: false, error: 'missing_url' });
+          return;
+        }
+
+        if (isRunning && activeTabId && sender.tab.id !== activeTabId) {
+          sendResponse({ success: false, error: 'not_target_tab' });
+          return;
+        }
+
+        if (!activeTabId) {
+          activeTabId = sender.tab.id;
           chrome.storage.local.set({ activeTabId });
         }
 
-        if (isRunning && activeTabId === tabId) {
-          chrome.tabs.sendMessage(tabId, {
-            action: 'start',
-            settings,
-            startMode: 'navigation'
-          }).catch(() => {});
-          attachDebugger(tabId);
+        {
+          const url = normalizeLinuxDoUrl(message.url);
+          if (!url) {
+            sendResponse({ success: false, error: 'invalid_url' });
+            return;
+          }
+          await chrome.tabs.update(sender.tab.id, { url });
         }
-      }
-      sendResponse({ success: true });
-      break;
 
-    case 'tabVisibility':
-      if (sender.tab && typeof message.visibilityState === 'string') {
-        tabVisibilityStateById[sender.tab.id] = {
-          visibilityState: message.visibilityState,
-          at: Date.now()
-        };
-      }
-      sendResponse({ success: true });
-      break;
-      
-    case 'offscreenPing':
-      sendResponse({ alive: true });
-      break;
+        sendResponse({ success: true });
+        return;
 
-    case 'offscreenTick':
-      runScrollStep('offscreen').catch(() => {});
-      sendResponse({ success: true });
-      break;
-      
-    case 'requestNavigation':
-      if (!sender.tab) {
-        sendResponse({ success: false, error: 'no_sender_tab' });
-        break;
-      }
+      default:
+        sendResponse({ success: false, error: 'unknown_action' });
+    }
+  })().catch((e) => {
+    console.error('[AutoHangout BG] Message handler error:', e?.message || String(e));
+    sendResponse({ success: false, error: e?.message || String(e) });
+  });
 
-      if (!message.url) {
-        sendResponse({ success: false, error: 'missing_url' });
-        break;
-      }
-
-      if (isRunning && activeTabId && sender.tab.id !== activeTabId) {
-        sendResponse({ success: false, error: 'not_target_tab' });
-        break;
-      }
-
-      if (!activeTabId) {
-        activeTabId = sender.tab.id;
-        chrome.storage.local.set({ activeTabId });
-      }
-
-      {
-        const url = normalizeLinuxDoUrl(message.url);
-        if (!url) {
-          sendResponse({ success: false, error: 'invalid_url' });
-          break;
-        }
-        chrome.tabs.update(sender.tab.id, { url });
-      }
-
-      sendResponse({ success: true });
-      break;
-  }
-  
   return true;
 });
 
@@ -1130,6 +1159,7 @@ async function stopAutomation() {
 
 // ============ ALARM HANDLERS ============
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  await ensureStateLoaded();
   if (!isRunning) return;
   
   const now = new Date().toLocaleTimeString();
@@ -1190,6 +1220,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 // ============ TAB EVENTS ============
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  await ensureStateLoaded();
   if (changeInfo.status === 'complete' && 
       tab.url?.startsWith('https://linux.do/') && 
       isRunning) {
@@ -1217,6 +1248,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  await ensureStateLoaded();
   if (!isRunning) return;
   
   try {
@@ -1235,7 +1267,8 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   } catch (e) {}
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await ensureStateLoaded();
   delete topicProgressByTabId[tabId];
   delete backgroundTopicStateByTabId[tabId];
   if (tabId === activeTabId) {
@@ -1249,16 +1282,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ============ WINDOW EVENTS ============
 chrome.windows.onFocusChanged.addListener((windowId) => {
-  if (!isRunning) return;
-  
-  console.log('[AutoHangout BG] Window focus:', windowId);
-  
-  // Check alarms still running
-  chrome.alarms.get('autoHangout-scroll', async (alarm) => {
-    if (!alarm && isRunning) {
-      console.log('[AutoHangout BG] Recreating alarms');
-      await startAutomation();
-    }
+  void ensureStateLoaded().then(() => {
+    if (!isRunning) return;
+
+    console.log('[AutoHangout BG] Window focus:', windowId);
+
+    // Check alarms still running
+    chrome.alarms.get('autoHangout-scroll', async (alarm) => {
+      if (!alarm && isRunning) {
+        console.log('[AutoHangout BG] Recreating alarms');
+        await startAutomation();
+      }
+    });
   });
 });
 
@@ -1345,15 +1380,7 @@ async function broadcastToContentScripts(message) {
 // ============ SERVICE WORKER LIFECYCLE ============
 self.addEventListener('activate', (event) => {
   console.log('[AutoHangout BG] Service worker activated');
-  
-  chrome.storage.local.get(['isRunning', 'settings', 'activeTabId'], async (data) => {
-    if (data.isRunning) {
-      isRunning = true;
-      activeTabId = data.activeTabId;
-      if (data.settings) settings = data.settings;
-      await startAutomation();
-    }
-  });
+  event.waitUntil(ensureStateLoaded());
 });
 
 self.addEventListener('install', () => {
