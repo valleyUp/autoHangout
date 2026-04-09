@@ -163,6 +163,40 @@ async function fetchLatestTopicPool() {
     .filter((topic) => Boolean(topic.url));
 }
 
+async function fetchTopicState(urlOrContext) {
+  const ctx = typeof urlOrContext === 'string'
+    ? parseTopicContextFromUrl(urlOrContext)
+    : urlOrContext;
+  if (!ctx?.topicId) return null;
+
+  const apiUrl = `https://linux.do/t/${ctx.slug || '-'}/${ctx.topicId}.json`;
+  const response = await fetch(apiUrl, {
+    credentials: 'include',
+    cache: 'no-store'
+  });
+  if (!response.ok) {
+    throw new Error(`topic_fetch_failed:${response.status}`);
+  }
+
+  const data = await response.json();
+  const slug = data?.slug || ctx.slug || '-';
+  const topicId = String(data?.id || ctx.topicId);
+  const highestPostNumber = Math.max(
+    data?.highest_post_number || 0,
+    data?.posts_count || 0,
+    ctx.postNumber || 0
+  );
+
+  return {
+    slug,
+    topicId,
+    total: highestPostNumber,
+    current: Math.max(1, ctx.postNumber || 1),
+    url: buildTopicUrl(slug, topicId, ctx.postNumber || 1),
+    source: 'topic-json'
+  };
+}
+
 async function navigateToRandomTopicFromFeed(now) {
   if (!activeTabId) return false;
 
@@ -234,18 +268,31 @@ async function advanceTopicInBackground(tab, now) {
   const ctx = parseTopicContextFromUrl(tab.url);
   if (!ctx) return false;
 
-  const cached = topicProgressByTabId[tab.id];
-  if (!cached) return false;
-  if (cached.source === 'estimated' && (cached.total || 0) <= 20) return false;
+  let fetched;
+  try {
+    fetched = await fetchTopicState(ctx);
+  } catch (e) {
+    console.warn('[AutoHangout BG] Failed to fetch topic state:', e?.message || String(e));
+    fetched = null;
+  }
 
-  const total = Math.max(cached?.total || 0, ctx.postNumber || 0);
-  const current = Math.max(cached?.current || 0, ctx.postNumber || 1);
+  const cached = topicProgressByTabId[tab.id] || {};
+  const total = Math.max(
+    fetched?.total || 0,
+    cached?.total || 0,
+    ctx.postNumber || 0
+  );
+  const current = Math.max(
+    fetched?.current || 0,
+    cached?.current || 0,
+    ctx.postNumber || 1
+  );
 
   if (!total || total <= 1) return false;
 
   if (current >= Math.max(1, total - 1)) {
     lastBackgroundTopicAdvanceAt = now;
-    return await finishBackgroundTopic(cached?.url || tab.url);
+    return await finishBackgroundTopic(fetched?.url || cached?.url || tab.url);
   }
 
   const step =
@@ -259,18 +306,19 @@ async function advanceTopicInBackground(tab, now) {
 
   lastBackgroundTopicAdvanceAt = now;
   topicProgressByTabId[tab.id] = {
-    ...(cached || {}),
+    ...cached,
+    ...(fetched || {}),
     url: nextUrl,
     topicId: ctx.topicId,
     current: nextPost,
     total,
     at: now,
-    source: 'background-step'
+    source: 'background-json'
   };
 
   await ensureTabPersistence(tab.id);
   await chrome.tabs.update(tab.id, { url: nextUrl });
-  console.log('[AutoHangout BG] Advanced frozen topic in background:', nextUrl);
+  console.log('[AutoHangout BG] Advanced topic in background:', nextUrl);
   return true;
 }
 
@@ -445,7 +493,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         if (isRunning && activeTabId === tabId) {
-          chrome.tabs.sendMessage(tabId, { action: 'start', settings }).catch(() => {});
+          chrome.tabs.sendMessage(tabId, {
+            action: 'start',
+            settings,
+            startMode: 'navigation'
+          }).catch(() => {});
           attachDebugger(tabId);
         }
       }
@@ -742,47 +794,34 @@ async function runScrollStep(trigger) {
     }
     await ensureTabPersistence(activeTabId);
 
+    let isForeground = false;
     try {
       const win = await chrome.windows.get(tab.windowId);
       const visibility = tabVisibilityStateById[activeTabId]?.visibilityState;
-      const isForeground =
+      isForeground =
         tab.active &&
         win?.focused &&
         win?.state !== 'minimized' &&
         visibility !== 'hidden';
 
-      // If the user is actively viewing the target tab, don't fight them.
       if (isForeground) return;
     } catch (_) {
-      // If we can't determine window state, prefer scrolling (better than getting stuck).
-    }
-
-    const basePixels = 80 + settings.scrollSpeed * 30;
-    const scrollAmount = Math.floor(basePixels * (0.7 + Math.random() * 0.6));
-
-    let preferDebugger = true;
-    try {
-      const win = await chrome.windows.get(tab.windowId);
-      preferDebugger =
-        !tab.active ||
-        !win?.focused ||
-        win?.state === 'minimized' ||
-        tabVisibilityStateById[activeTabId]?.visibilityState === 'hidden';
-    } catch (_) {
-      preferDebugger = true;
+      isForeground = false;
     }
 
     const isTopicTab = /^https:\/\/linux\.do\/t\/[^/]+\/\d+/.test(tab.url);
 
-    if (preferDebugger && !isTopicTab) {
-      const navigated = await navigateToRandomTopicFromFeed(now);
-      if (navigated) {
-        lastScrollAt = now;
+    // Hidden or minimized tabs should be driven by the background state machine,
+    // not by page JS. This keeps progress moving even when Chrome freezes the tab.
+    if (!isForeground) {
+      if (!isTopicTab) {
+        const navigated = await navigateToRandomTopicFromFeed(now);
+        if (navigated) {
+          lastScrollAt = now;
+        }
+        return;
       }
-      return;
-    }
 
-    if (preferDebugger && tab.frozen && isTopicTab) {
       const advanced = await advanceTopicInBackground(tab, now);
       if (advanced) {
         lastScrollAt = now;
@@ -790,51 +829,37 @@ async function runScrollStep(trigger) {
       }
     }
 
-    if (preferDebugger) {
-      const result = await performDebuggerScroll(activeTabId, scrollAmount);
-      if (result.success) {
-        lastScrollAt = now;
-        await sendMessageToTab(activeTabId, {
-          action: 'scrollPerformed',
-          scrollAmount,
-          method: result.method,
-          trigger,
-          settings
-        });
-        return;
-      }
+    const basePixels = 80 + settings.scrollSpeed * 30;
+    const scrollAmount = Math.floor(basePixels * (0.7 + Math.random() * 0.6));
 
-      if (isTopicTab) {
-        const advanced = await advanceTopicInBackground(tab, now);
-        if (advanced) {
-          lastScrollAt = now;
-          return;
-        }
-      }
-    }
-
-    // Foreground fallback: ask the content script to scroll in isolated world.
+    // Foreground path: ask the content script to scroll in isolated world.
     const delivered = await sendMessageToTab(activeTabId, {
       action: 'doScroll',
       scrollAmount,
       trigger,
       settings
+    }, {
+      timeoutMs: 800
     });
     if (delivered) {
       lastScrollAt = now;
       return;
     }
 
-    // Final fallback: attempt CDP scroll if messaging fails.
+    // Foreground fallback: attempt CDP scroll if messaging fails.
     const result = await performDebuggerScroll(activeTabId, scrollAmount);
     if (result.success) {
       lastScrollAt = now;
-      await sendMessageToTab(activeTabId, {
+      void sendMessageToTab(activeTabId, {
         action: 'scrollPerformed',
         scrollAmount,
         method: result.method,
         trigger,
         settings
+      }, {
+        fireAndForget: true,
+        timeoutMs: 250,
+        injectIfMissing: false
       });
       return;
     }
@@ -894,7 +919,11 @@ async function startAutomation() {
   } catch (_) {}
   if (activeTabId) {
     await ensureTabPersistence(activeTabId);
-    await sendMessageToTab(activeTabId, { action: 'start', settings });
+    await sendMessageToTab(activeTabId, {
+      action: 'start',
+      settings,
+      startMode: 'manual'
+    });
   }
   
   // Attach debugger
@@ -1001,7 +1030,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       
       // Ensure debugger is attached to the active tab and start content script.
       await attachDebugger(tabId);
-      await sendMessageToTab(tabId, { action: 'start', settings });
+      await sendMessageToTab(tabId, {
+        action: 'start',
+        settings,
+        startMode: 'navigation'
+      });
     }
   }
 });
@@ -1052,10 +1085,31 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 
 // ============ BROADCAST ============
-async function sendMessageToTab(tabId, message) {
-  try {
-    await chrome.tabs.sendMessage(tabId, message);
+async function sendMessageToTab(tabId, message, options = {}) {
+  const {
+    timeoutMs = 1200,
+    fireAndForget = false,
+    injectIfMissing = true
+  } = options;
+
+  const sendWithTimeout = async () => {
+    const sendPromise = chrome.tabs.sendMessage(tabId, message);
+    if (fireAndForget) {
+      sendPromise.catch(() => {});
+      return true;
+    }
+
+    await Promise.race([
+      sendPromise,
+      sleep(timeoutMs).then(() => {
+        throw new Error('message_timeout');
+      })
+    ]);
     return true;
+  };
+
+  try {
+    return await sendWithTimeout();
   } catch (e) {
     const needsContentScript = new Set([
       'start',
@@ -1068,6 +1122,14 @@ async function sendMessageToTab(tabId, message) {
     ]);
 
     if (!needsContentScript.has(message.action)) return false;
+    if (!injectIfMissing) return false;
+
+    const messageText = String(e?.message || e || '');
+    const missingReceiver =
+      messageText.includes('Receiving end does not exist') ||
+      messageText.includes('Could not establish connection') ||
+      messageText.includes('No tab with id');
+    if (!missingReceiver) return false;
 
     try {
       await chrome.scripting.executeScript({
@@ -1077,8 +1139,7 @@ async function sendMessageToTab(tabId, message) {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           await sleep(200 + attempt * 200);
-          await chrome.tabs.sendMessage(tabId, message);
-          return true;
+          return await sendWithTimeout();
         } catch (_) {}
       }
       return false;
@@ -1091,9 +1152,12 @@ async function sendMessageToTab(tabId, message) {
 async function broadcastToContentScripts(message) {
   try {
     const tabs = await chrome.tabs.query({ url: 'https://linux.do/*' });
-    
+
     for (const tab of tabs) {
-      await sendMessageToTab(tab.id, message);
+      await sendMessageToTab(tab.id, message, {
+        fireAndForget: true,
+        timeoutMs: 250
+      });
     }
   } catch (e) {
     console.error('[AutoHangout BG] Broadcast error:', e.message);

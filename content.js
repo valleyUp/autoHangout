@@ -207,7 +207,7 @@
     
     if (message.action === 'start') {
       if (message.settings) updateLocalSettings(message.settings);
-      start();
+      start(message.startMode || 'manual');
     } else if (message.action === 'stop') {
       stop();
     } else if (message.action === 'doScroll') {
@@ -330,7 +330,7 @@
     log(`[Plan] target=${topicExitTargetPercent}% minScrolls=${topicMinScrolls}`);
   }
 
-  function start() {
+  function start(startMode = 'manual') {
     if (isRunning) return;
     
     isRunning = true;
@@ -345,9 +345,9 @@
     reportVisibility();
     
     const pageType = getPageType();
-    log('Starting, page:', pageType, 'background:', isBackgroundMode);
+    log('Starting, page:', pageType, 'background:', isBackgroundMode, 'mode:', startMode);
 
-    if (settings.readMode === 'random' && pageType === 'topic') {
+    if (settings.readMode === 'random' && pageType === 'topic' && startMode !== 'navigation') {
       log('Random mode starts from /latest, leaving current topic page');
       requestNavigation(window.location.origin + '/latest');
       return;
