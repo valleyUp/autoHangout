@@ -36,6 +36,7 @@
   const TOPIC_HISTORY_KEY = 'topicHistory';
   const VISITED_CACHE_TTL_MS = 15000;
   const MAX_TRUSTED_PROGRESS_LEAD = 60;
+  const MIN_VISIBLE_POST_HEIGHT = 48;
   let visitedTopicIds = new Set();
   let visitedCacheLoadedAt = 0;
   let visitedCacheLoading = false;
@@ -177,7 +178,11 @@
       url: window.location.href,
       current,
       total,
-      source: progress.source || 'unknown'
+      source: progress.source || 'unknown',
+      furthestSeen: Math.max(0, parseInt(progress.furthestSeen, 10) || 0),
+      maxLoaded: Math.max(0, parseInt(progress.maxLoaded, 10) || 0),
+      minLoaded: Math.max(0, parseInt(progress.minLoaded, 10) || 0),
+      distanceToBottom: Math.max(0, parseInt(progress.distanceToBottom, 10) || 0)
     });
   }
 
@@ -539,21 +544,66 @@
 
   // ============ TOPIC PROGRESS ============
   function getMaxLoadedPostNumber() {
-    const posts = document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]');
-    let maxLoadedPostNumber = 0;
+    const metrics = getTopicViewportMetrics();
+    return metrics.maxLoadedPostNumber;
+  }
 
-    for (const post of posts) {
+  function getTopicViewportMetrics() {
+    const viewportHeight = Math.max(
+      window.innerHeight || 0,
+      document.documentElement?.clientHeight || 0,
+      1
+    );
+    const viewportCenter = viewportHeight / 2;
+    const viewportTop = 0;
+    const viewportBottom = viewportHeight;
+    const posts = Array.from(
+      document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]')
+    ).map((post) => {
       const rawPostNumber =
         post.getAttribute('data-post-number') ||
         post.dataset?.postNumber ||
         '';
       const postNumber = parseInt(rawPostNumber, 10);
-      if (Number.isFinite(postNumber) && postNumber > maxLoadedPostNumber) {
-        maxLoadedPostNumber = postNumber;
-      }
-    }
+      const rect = post.getBoundingClientRect();
+      const visibleTop = Math.max(rect.top, viewportTop);
+      const visibleBottom = Math.min(rect.bottom, viewportBottom);
+      const visibleHeight = Math.max(0, visibleBottom - visibleTop);
 
-    return maxLoadedPostNumber;
+      return {
+        postNumber,
+        top: rect.top,
+        bottom: rect.bottom,
+        height: Math.max(rect.height, 0),
+        visibleHeight,
+        centerDistance: Math.abs(((rect.top + rect.bottom) / 2) - viewportCenter)
+      };
+    }).filter((post) => Number.isFinite(post.postNumber) && post.postNumber > 0)
+      .sort((a, b) => a.postNumber - b.postNumber);
+
+    const visiblePosts = posts.filter((post) => post.visibleHeight > 0);
+    const centerAnchoredPost =
+      visiblePosts.find((post) => post.top <= viewportCenter && post.bottom >= viewportCenter) ||
+      null;
+    const anchorPost = centerAnchoredPost ||
+      visiblePosts.slice().sort((a, b) => {
+        if (a.centerDistance !== b.centerDistance) return a.centerDistance - b.centerDistance;
+        return b.visibleHeight - a.visibleHeight;
+      })[0] ||
+      null;
+    const seenPosts = visiblePosts.filter((post) => {
+      return post.visibleHeight >= Math.max(24, Math.min(MIN_VISIBLE_POST_HEIGHT, post.height * 0.2));
+    });
+    const furthestSeenPost = (seenPosts.length > 0 ? seenPosts : visiblePosts).at(-1) || anchorPost;
+
+    return {
+      posts,
+      visiblePosts,
+      anchorPost,
+      furthestSeenPost,
+      minLoadedPostNumber: posts[0]?.postNumber || 0,
+      maxLoadedPostNumber: posts.at(-1)?.postNumber || 0
+    };
   }
 
   function getTopicProgress() {
@@ -579,16 +629,17 @@
       total = Math.max(total, urlPostNumber);
     }
 
-    const maxLoadedPostNumber = getMaxLoadedPostNumber();
+    const viewportMetrics = getTopicViewportMetrics();
+    const maxLoadedPostNumber = viewportMetrics.maxLoadedPostNumber;
     if (maxLoadedPostNumber > 0) {
       candidates.push({ source: 'dom', current: maxLoadedPostNumber });
       total = Math.max(total, maxLoadedPostNumber);
     }
 
-    const posts = document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]');
-    total = Math.max(total, posts.length, 20);
+    total = Math.max(total, viewportMetrics.posts.length, 20);
 
     const anchorCurrent =
+      viewportMetrics.anchorPost?.postNumber ||
       urlPostNumber ||
       candidates.find((candidate) => candidate.source === 'timeline')?.current ||
       maxLoadedPostNumber ||
@@ -604,10 +655,17 @@
     );
 
     if (current > 0) {
+      const furthestSeen = Math.max(
+        current,
+        viewportMetrics.furthestSeenPost?.postNumber || 0
+      );
       return {
         current,
+        furthestSeen,
+        maxLoaded: maxLoadedPostNumber,
+        minLoaded: viewportMetrics.minLoadedPostNumber,
         total,
-        source: sourceParts.join('+') || 'dom'
+        source: sourceParts.concat('visible').join('+') || 'dom'
       };
     }
 
@@ -616,25 +674,42 @@
 
   function updateProgress() {
     const newInfo = getTopicProgress();
-    newInfo.total = Math.max(
-      newInfo.total || 0,
-      topicInfo?.total || 0
-    );
+    const previousInfo = topicInfo || {};
+    const mergedInfo = {
+      ...previousInfo,
+      ...newInfo,
+      current: Math.max(newInfo.current || 0, previousInfo.current || 0),
+      furthestSeen: Math.max(
+        newInfo.furthestSeen || 0,
+        previousInfo.furthestSeen || 0,
+        newInfo.current || 0
+      ),
+      maxLoaded: Math.max(newInfo.maxLoaded || 0, previousInfo.maxLoaded || 0),
+      minLoaded: previousInfo.minLoaded && newInfo.minLoaded
+        ? Math.min(previousInfo.minLoaded, newInfo.minLoaded)
+        : (newInfo.minLoaded || previousInfo.minLoaded || 0),
+      total: Math.max(newInfo.total || 0, previousInfo.total || 0)
+    };
 
     // Never map page scroll percentage to an absolute post number.
     // Discourse topic height is not linear with post ids, especially on long threads,
     // and that causes catastrophic jumps such as 200 -> 2000+.
-    
-    if (newInfo.current > lastProgress) {
+
+    const previousTail = previousInfo.furthestSeen || previousInfo.current || 0;
+    const previousMaxLoaded = previousInfo.maxLoaded || 0;
+    const advanced =
+      mergedInfo.current > lastProgress ||
+      mergedInfo.furthestSeen > previousTail ||
+      mergedInfo.maxLoaded > previousMaxLoaded;
+
+    if (advanced) {
       stuckCount = 0;
-      lastProgress = newInfo.current;
+      lastProgress = mergedInfo.current;
     } else {
       stuckCount++;
     }
-    
-    if (newInfo.current > (topicInfo?.current || 0)) {
-      topicInfo = newInfo;
-    }
+
+    topicInfo = mergedInfo;
     const progress = topicInfo || newInfo;
     reportTopicProgress(progress);
     return progress;
@@ -652,17 +727,16 @@
     const distanceToBottom = Math.max(0, scrollHeight - viewportBottom);
     const nearBottom = distanceToBottom <= 180;
 
-    const posts = Array.from(document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]'));
-    let maxLoadedPostNumber = 0;
-    for (const post of posts) {
-      const postNumber = parseInt(post.getAttribute('data-post-number') || '', 10);
-      if (Number.isFinite(postNumber) && postNumber > maxLoadedPostNumber) {
-        maxLoadedPostNumber = postNumber;
-      }
-    }
-
     const total = progress?.total || 0;
-    const observedCurrent = Math.max(progress?.current || 0, maxLoadedPostNumber);
+    const furthestSeen = Math.max(
+      progress?.furthestSeen || 0,
+      progress?.current || 0
+    );
+    const maxLoadedPostNumber = Math.max(
+      progress?.maxLoaded || 0,
+      furthestSeen
+    );
+    const observedCurrent = Math.max(furthestSeen, maxLoadedPostNumber);
     const nearTail = total > 0
       ? observedCurrent >= Math.max(1, total - 1)
       : nearBottom;

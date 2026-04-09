@@ -16,15 +16,18 @@ let scrollInProgress = false;
 let tabVisibilityStateById = {};
 let lastScrollAt = 0;
 let topicProgressByTabId = {};
+let backgroundTopicStateByTabId = {};
 let backgroundListTickCount = 0;
 let backgroundNextListNavigateTick = 0;
 let lastBackgroundListNavigateAt = 0;
-let lastBackgroundTopicAdvanceAt = 0;
 
 const MIN_SCROLL_INTERVAL_MS = 2500;
 const WATCHDOG_ALARM_PERIOD_MINUTES = 0.5;
-const MIN_BACKGROUND_TOPIC_ADVANCE_MS = 12000;
-const MAX_TRUSTED_PROGRESS_LEAD = 60;
+const MIN_TOPIC_VISIBLE_POST_HEIGHT = 48;
+const MIN_BACKGROUND_RECOVERY_STALL_MS = 45000;
+const BACKGROUND_RECOVERY_COOLDOWN_MS = 90000;
+const BACKGROUND_RECOVERY_MAX_FORWARD = 18;
+const BACKGROUND_FINISH_STABLE_MS = 8000;
 
 console.log('[AutoHangout BG] Service worker started (v2.3.2)');
 
@@ -70,35 +73,103 @@ function buildTopicUrl(slug, topicId, postNumber) {
   return `https://linux.do/t/${safeSlug}/${topicId}/${postNumber}`;
 }
 
-function isReliableTopicProgressSource(source) {
-  const text = String(source || '').toLowerCase();
-  if (!text) return false;
-  return text.includes('timeline') || text.includes('url') || text.includes('dom');
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-function getTrustedCachedTopicCurrent(cached, ctx) {
-  if (!isReliableTopicProgressSource(cached?.source)) return 0;
+function cacheTopicProgressForTab(tabId, progress, fallback = {}) {
+  if (typeof tabId !== 'number' || !progress) return null;
 
-  const cachedCurrent = Math.max(0, parseInt(cached?.current, 10) || 0);
-  const currentPost = Math.max(1, ctx?.postNumber || 1);
-  if (!cachedCurrent) return 0;
+  const cached = {
+    ...(topicProgressByTabId[tabId] || {}),
+    ...progress,
+    url: typeof progress.url === 'string' ? progress.url : fallback.url,
+    topicId: progress.topicId || fallback.topicId || null,
+    current: Math.max(0, parseInt(progress.current, 10) || 0),
+    total: Math.max(0, parseInt(progress.total, 10) || 0),
+    furthestSeen: Math.max(0, parseInt(progress.furthestSeen, 10) || 0),
+    maxLoaded: Math.max(0, parseInt(progress.maxLoaded, 10) || 0),
+    minLoaded: Math.max(0, parseInt(progress.minLoaded, 10) || 0),
+    distanceToBottom: Number.isFinite(parseInt(progress.distanceToBottom, 10))
+      ? Math.max(0, parseInt(progress.distanceToBottom, 10))
+      : null,
+    source: progress.source || fallback.source || 'unknown',
+    at: progress.at || Date.now()
+  };
 
-  // Content-script progress may drift slightly ahead of the canonical URL while
-  // the page is still settling, but anything far beyond that is untrustworthy.
-  if (cachedCurrent > currentPost + MAX_TRUSTED_PROGRESS_LEAD) {
-    console.warn(
-      '[AutoHangout BG] Ignoring suspicious cached topic progress:',
-      JSON.stringify({
-        topicId: ctx?.topicId,
-        currentPost,
-        cachedCurrent,
-        source: cached?.source
-      })
-    );
-    return 0;
+  topicProgressByTabId[tabId] = cached;
+  return cached;
+}
+
+function updateBackgroundTopicState(tabId, progress, now) {
+  if (typeof tabId !== 'number' || !progress) return null;
+
+  const state = backgroundTopicStateByTabId[tabId] || {};
+  const previousCurrent = state.current || 0;
+  const previousTail = state.furthestSeen || 0;
+  const previousMaxLoaded = state.maxLoaded || 0;
+  const advanced =
+    (progress.current || 0) > previousCurrent ||
+    (progress.furthestSeen || 0) > previousTail ||
+    (progress.maxLoaded || 0) > previousMaxLoaded;
+
+  if (advanced) {
+    state.lastProgressAt = now;
+    state.stalledSince = 0;
+  } else if (!state.stalledSince) {
+    state.stalledSince = now;
   }
 
-  return cachedCurrent;
+  const total = Math.max(progress.total || 0, 0);
+  const tail = Math.max(progress.furthestSeen || 0, progress.current || 0);
+  if (progress.atBottom && total > 0 && tail >= Math.max(1, total - 1)) {
+    state.finishCandidateAt ||= now;
+  } else {
+    state.finishCandidateAt = 0;
+  }
+
+  Object.assign(state, progress, { at: now });
+  backgroundTopicStateByTabId[tabId] = state;
+  return state;
+}
+
+function shouldFinishTopicFromProbe(progress, state, now) {
+  if (!progress || !state) return false;
+
+  const total = Math.max(progress.total || 0, 0);
+  const tail = Math.max(progress.furthestSeen || 0, progress.current || 0);
+  if (!progress.atBottom || total <= 0 || tail < Math.max(1, total - 1)) {
+    return false;
+  }
+
+  const stableFor = state.finishCandidateAt ? now - state.finishCandidateAt : 0;
+  return stableFor >= BACKGROUND_FINISH_STABLE_MS;
+}
+
+function planTopicRecoveryUrl(tab, progress, state) {
+  const ctx = parseTopicContextFromUrl(tab?.url);
+  if (!ctx || !progress?.total) return null;
+
+  const total = Math.max(progress.total || 0, 0);
+  const maxLoaded = Math.max(progress.maxLoaded || 0, progress.furthestSeen || 0, ctx.postNumber || 1);
+  if (maxLoaded >= Math.max(1, total - 1)) return null;
+
+  const current = Math.max(progress.current || 0, ctx.postNumber || 1);
+  const furthestSeen = Math.max(progress.furthestSeen || 0, current);
+  const loadedWindow = clampNumber(
+    Math.max(0, (progress.maxLoaded || 0) - (progress.minLoaded || 0) + 1) || 12,
+    8,
+    24
+  );
+  const overlap = clampNumber(Math.round(loadedWindow * 0.25), 3, 8);
+  const forward = clampNumber(Math.round(loadedWindow * 0.5), 6, BACKGROUND_RECOVERY_MAX_FORWARD);
+  const recoveryPost = Math.min(
+    total,
+    Math.max(maxLoaded - overlap, furthestSeen + forward, current + 1)
+  );
+  if (recoveryPost <= ctx.postNumber) return null;
+
+  return buildTopicUrl(ctx.slug, ctx.topicId, recoveryPost);
 }
 
 function touchHistoryOrder(topicId) {
@@ -195,40 +266,6 @@ async function fetchLatestTopicPool() {
     .filter((topic) => Boolean(topic.url));
 }
 
-async function fetchTopicState(urlOrContext) {
-  const ctx = typeof urlOrContext === 'string'
-    ? parseTopicContextFromUrl(urlOrContext)
-    : urlOrContext;
-  if (!ctx?.topicId) return null;
-
-  const apiUrl = `https://linux.do/t/${ctx.slug || '-'}/${ctx.topicId}.json`;
-  const response = await fetch(apiUrl, {
-    credentials: 'include',
-    cache: 'no-store'
-  });
-  if (!response.ok) {
-    throw new Error(`topic_fetch_failed:${response.status}`);
-  }
-
-  const data = await response.json();
-  const slug = data?.slug || ctx.slug || '-';
-  const topicId = String(data?.id || ctx.topicId);
-  const highestPostNumber = Math.max(
-    data?.highest_post_number || 0,
-    data?.posts_count || 0,
-    ctx.postNumber || 0
-  );
-
-  return {
-    slug,
-    topicId,
-    total: highestPostNumber,
-    current: Math.max(1, ctx.postNumber || 1),
-    url: buildTopicUrl(slug, topicId, ctx.postNumber || 1),
-    source: 'topic-json'
-  };
-}
-
 async function navigateToRandomTopicFromFeed(now) {
   if (!activeTabId) return false;
 
@@ -290,68 +327,6 @@ async function finishBackgroundTopic(url) {
   await ensureTabPersistence(activeTabId);
   await chrome.tabs.update(activeTabId, { url: 'https://linux.do/latest' });
   console.log('[AutoHangout BG] Background topic completed, returning to latest');
-  return true;
-}
-
-async function advanceTopicInBackground(tab, now) {
-  if (!tab?.id || !tab.url) return false;
-  if (now - lastBackgroundTopicAdvanceAt < MIN_BACKGROUND_TOPIC_ADVANCE_MS) return false;
-
-  const ctx = parseTopicContextFromUrl(tab.url);
-  if (!ctx) return false;
-
-  let fetched;
-  try {
-    fetched = await fetchTopicState(ctx);
-  } catch (e) {
-    console.warn('[AutoHangout BG] Failed to fetch topic state:', e?.message || String(e));
-    fetched = null;
-  }
-
-  const cached = topicProgressByTabId[tab.id] || {};
-  const cachedCurrent = getTrustedCachedTopicCurrent(cached, ctx);
-  const total = Math.max(
-    fetched?.total || 0,
-    cached?.total || 0,
-    ctx.postNumber || 0
-  );
-  const current = Math.max(
-    fetched?.current || 0,
-    cachedCurrent,
-    ctx.postNumber || 1
-  );
-
-  if (!total || total <= 1) return false;
-
-  if (current >= Math.max(1, total - 1)) {
-    lastBackgroundTopicAdvanceAt = now;
-    return await finishBackgroundTopic(fetched?.url || cached?.url || tab.url);
-  }
-
-  const step =
-    total >= 300 ? 25 :
-    total >= 150 ? 18 :
-    total >= 80 ? 12 :
-    8;
-  const nextPost = Math.min(total, Math.max(current + 1, current + step));
-  const nextUrl = buildTopicUrl(ctx.slug, ctx.topicId, nextPost);
-  if (!nextUrl || nextUrl === tab.url) return false;
-
-  lastBackgroundTopicAdvanceAt = now;
-  topicProgressByTabId[tab.id] = {
-    ...cached,
-    ...(fetched || {}),
-    url: nextUrl,
-    topicId: ctx.topicId,
-    current: nextPost,
-    total,
-    at: now,
-    source: 'background-json'
-  };
-
-  await ensureTabPersistence(tab.id);
-  await chrome.tabs.update(tab.id, { url: nextUrl });
-  console.log('[AutoHangout BG] Advanced topic in background:', nextUrl);
   return true;
 }
 
@@ -496,14 +471,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'topicProgress':
       if (sender.tab?.id && typeof message.current === 'number' && typeof message.total === 'number') {
-        topicProgressByTabId[sender.tab.id] = {
+        const cached = cacheTopicProgressForTab(sender.tab.id, {
           url: typeof message.url === 'string' ? message.url : sender.tab.url,
           topicId: message.topicId || parseTopicIdFromUrl(message.url || sender.tab.url || ''),
           current: message.current,
           total: message.total,
+          furthestSeen: message.furthestSeen,
+          maxLoaded: message.maxLoaded,
+          minLoaded: message.minLoaded,
+          distanceToBottom: message.distanceToBottom,
           source: message.source || 'content',
           at: Date.now()
-        };
+        });
+        updateBackgroundTopicState(sender.tab.id, cached, Date.now());
       }
       sendResponse({ success: true });
       break;
@@ -697,6 +677,111 @@ async function getPageY(tabId) {
   }
 }
 
+async function probeTopicProgressViaDebugger(tabId) {
+  if (!debuggerAttached || debuggerTabId !== tabId) {
+    const attached = await attachDebugger(tabId);
+    if (!attached) return null;
+  }
+
+  try {
+    const result = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+      expression: `
+        (function() {
+          const viewportHeight = Math.max(
+            window.innerHeight || 0,
+            document.documentElement?.clientHeight || 0,
+            1
+          );
+          const viewportCenter = viewportHeight / 2;
+          const viewportBottom = viewportHeight;
+          const posts = Array.from(
+            document.querySelectorAll('article[data-post-number], .topic-post[data-post-number]')
+          ).map((post) => {
+            const postNumber = parseInt(
+              post.getAttribute('data-post-number') || post.dataset?.postNumber || '',
+              10
+            );
+            const rect = post.getBoundingClientRect();
+            const visibleTop = Math.max(rect.top, 0);
+            const visibleBottom = Math.min(rect.bottom, viewportBottom);
+            const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+            return {
+              postNumber,
+              top: rect.top,
+              bottom: rect.bottom,
+              height: Math.max(rect.height, 0),
+              visibleHeight,
+              centerDistance: Math.abs(((rect.top + rect.bottom) / 2) - viewportCenter)
+            };
+          }).filter((post) => Number.isFinite(post.postNumber) && post.postNumber > 0)
+            .sort((a, b) => a.postNumber - b.postNumber);
+
+          const visiblePosts = posts.filter((post) => post.visibleHeight > 0);
+          const centerAnchoredPost =
+            visiblePosts.find((post) => post.top <= viewportCenter && post.bottom >= viewportCenter) ||
+            null;
+          const anchorPost = centerAnchoredPost ||
+            visiblePosts.slice().sort((a, b) => {
+              if (a.centerDistance !== b.centerDistance) return a.centerDistance - b.centerDistance;
+              return b.visibleHeight - a.visibleHeight;
+            })[0] ||
+            null;
+          const seenPosts = visiblePosts.filter((post) => {
+            return post.visibleHeight >= Math.max(
+              24,
+              Math.min(${MIN_TOPIC_VISIBLE_POST_HEIGHT}, post.height * 0.2)
+            );
+          });
+          const furthestSeenPost =
+            (seenPosts.length > 0 ? seenPosts : visiblePosts).at(-1) ||
+            anchorPost;
+          const timelineMatch = (
+            document.querySelector('.timeline-replies')?.textContent ||
+            ''
+          ).match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+          const timelineCurrent = timelineMatch ? parseInt(timelineMatch[1], 10) : 0;
+          const timelineTotal = timelineMatch ? parseInt(timelineMatch[2], 10) : 0;
+          const urlMatch = window.location.pathname.match(/\\/t\\/[^/]+\\/\\d+\\/(\\d+)/);
+          const urlPostNumber = urlMatch ? parseInt(urlMatch[1], 10) : 1;
+          const doc = document.documentElement;
+          const scrollTop = window.scrollY || doc.scrollTop || 0;
+          const scrollHeight = Math.max(
+            doc.scrollHeight || 0,
+            document.body?.scrollHeight || 0,
+            viewportHeight
+          );
+          const distanceToBottom = Math.max(0, scrollHeight - (scrollTop + viewportHeight));
+
+          return {
+            url: window.location.href,
+            source: 'debugger-dom',
+            current: Math.max(anchorPost?.postNumber || 0, urlPostNumber || 0),
+            furthestSeen: Math.max(
+              furthestSeenPost?.postNumber || 0,
+              anchorPost?.postNumber || 0,
+              timelineCurrent || 0,
+              urlPostNumber || 0
+            ),
+            minLoaded: posts[0]?.postNumber || 0,
+            maxLoaded: posts.at(-1)?.postNumber || 0,
+            total: Math.max(timelineTotal || 0, posts.at(-1)?.postNumber || 0, urlPostNumber || 0),
+            distanceToBottom,
+            atBottom: distanceToBottom <= 180,
+            visibleCount: visiblePosts.length
+          };
+        })()
+      `,
+      returnByValue: true,
+      allowUnsafeEvalBlockedByCSP: true
+    });
+
+    return result?.result?.value || null;
+  } catch (e) {
+    console.warn('[AutoHangout BG] Failed to probe topic progress:', e?.message || String(e));
+    return null;
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -810,6 +895,44 @@ async function performDebuggerScroll(tabId, scrollAmount) {
   }
 }
 
+async function maybeRecoverStalledTopic(tab, progress, scrollResult, now) {
+  if (!tab?.id || !tab.url) return false;
+
+  const state = backgroundTopicStateByTabId[tab.id] || {};
+  const cached = topicProgressByTabId[tab.id] || {};
+  const effectiveProgress = progress || cached;
+  if (!effectiveProgress?.total) return false;
+
+  const stalledSince = state.stalledSince || state.lastProgressAt || 0;
+  const stalledFor = stalledSince ? now - stalledSince : 0;
+  const recentRecoveryAt = state.lastRecoveryAt || 0;
+  const canRecover =
+    stalledFor >= MIN_BACKGROUND_RECOVERY_STALL_MS &&
+    now - recentRecoveryAt >= BACKGROUND_RECOVERY_COOLDOWN_MS;
+  if (!canRecover) return false;
+
+  const nearLoadedTail =
+    effectiveProgress.atBottom ||
+    (typeof effectiveProgress.distanceToBottom === 'number' &&
+      effectiveProgress.distanceToBottom <= 220);
+  if (!nearLoadedTail) return false;
+
+  const nextUrl = planTopicRecoveryUrl(tab, effectiveProgress, state);
+  if (!nextUrl) return false;
+
+  state.lastRecoveryAt = now;
+  state.stalledSince = now;
+  backgroundTopicStateByTabId[tab.id] = state;
+  await ensureTabPersistence(tab.id);
+  await chrome.tabs.update(tab.id, { url: nextUrl });
+  console.log('[AutoHangout BG] Recovered stalled topic near current window:', nextUrl, {
+    frozen: Boolean(tab.frozen),
+    scrollSuccess: Boolean(scrollResult?.success),
+    stalledFor
+  });
+  return true;
+}
+
 async function runScrollStep(trigger) {
   if (!isRunning) return;
   if (!activeTabId) return;
@@ -842,28 +965,47 @@ async function runScrollStep(trigger) {
       isForeground = false;
     }
 
-    const isTopicTab = /^https:\/\/linux\.do\/t\/[^/]+\/\d+/.test(tab.url);
+    const basePixels = 80 + settings.scrollSpeed * 30;
+    const scrollAmount = Math.floor(basePixels * (0.7 + Math.random() * 0.6));
 
-    // Hidden or minimized tabs should be driven by the background state machine,
-    // not by page JS. This keeps progress moving even when Chrome freezes the tab.
-    if (!isForeground) {
-      if (!isTopicTab) {
-        const navigated = await navigateToRandomTopicFromFeed(now);
-        if (navigated) {
-          lastScrollAt = now;
-        }
+    const isTopicTab = /^https:\/\/linux\.do\/t\/[^/]+\/\d+/.test(tab.url);
+    if (!isForeground && !isTopicTab) {
+      const navigated = await navigateToRandomTopicFromFeed(now);
+      if (navigated) {
+        lastScrollAt = now;
+      }
+      return;
+    }
+
+    if (!isForeground && isTopicTab) {
+      const result = await performDebuggerScroll(activeTabId, scrollAmount);
+      const probe = await probeTopicProgressViaDebugger(activeTabId);
+      const cached = probe
+        ? cacheTopicProgressForTab(activeTabId, probe, {
+            url: tab.url,
+            topicId: parseTopicIdFromUrl(tab.url),
+            source: 'debugger-dom'
+          })
+        : topicProgressByTabId[activeTabId] || null;
+      const state = cached ? updateBackgroundTopicState(activeTabId, cached, now) : null;
+
+      if (cached && shouldFinishTopicFromProbe(cached, state, now)) {
+        lastScrollAt = now;
+        await finishBackgroundTopic(cached.url || tab.url);
         return;
       }
 
-      const advanced = await advanceTopicInBackground(tab, now);
-      if (advanced) {
+      const recovered = await maybeRecoverStalledTopic(tab, cached, result, now);
+      if (recovered) {
+        lastScrollAt = now;
+        return;
+      }
+
+      if (result.success) {
         lastScrollAt = now;
         return;
       }
     }
-
-    const basePixels = 80 + settings.scrollSpeed * 30;
-    const scrollAmount = Math.floor(basePixels * (0.7 + Math.random() * 0.6));
 
     // Foreground path: ask the content script to scroll in isolated world.
     const delivered = await sendMessageToTab(activeTabId, {
@@ -913,7 +1055,7 @@ async function runScrollStep(trigger) {
 async function startAutomation() {
   console.log('[AutoHangout BG] Starting automation');
   resetBackgroundListPlan();
-  lastBackgroundTopicAdvanceAt = 0;
+  backgroundTopicStateByTabId = {};
   
   // Setup offscreen document
   await setupOffscreen();
@@ -971,6 +1113,7 @@ async function stopAutomation() {
   console.log('[AutoHangout BG] Stopping automation');
   await chrome.alarms.clearAll();
   broadcastToContentScripts({ action: 'stop' });
+  backgroundTopicStateByTabId = {};
 
   // Offscreen should only exist while running; close it to avoid unnecessary wakeups.
   try {
@@ -1051,6 +1194,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       tab.url?.startsWith('https://linux.do/') && 
       isRunning) {
     console.log('[AutoHangout BG] Tab updated:', tabId);
+    delete backgroundTopicStateByTabId[tabId];
 
     if (tabId === activeTabId && typeof tab.url === 'string') {
       recordTopicSeen(tab.url);
@@ -1093,6 +1237,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete topicProgressByTabId[tabId];
+  delete backgroundTopicStateByTabId[tabId];
   if (tabId === activeTabId) {
     console.log('[AutoHangout BG] Active tab closed');
     debuggerAttached = false;
